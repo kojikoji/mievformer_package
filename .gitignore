@@ -1,0 +1,30 @@
+# General
+.DS_Store
+.venv
+__pycache__
+*.egg-info
+.ipynb_checkpoints
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Documentation
+docs/_build/
+
+# PyTorch Lightning
+lightning_logs/
+ckpt/
+
+# Model checkpoints
+*.pth
+*.pt
+
+# Generated images (exclude those in docs/_static/images)
+*.png
+!docs/_static/images/*.png
+
+# Build artifacts
+dist/
+build/
