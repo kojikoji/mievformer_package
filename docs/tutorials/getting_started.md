@@ -1,6 +1,6 @@
-# mievformer Tutorial
+# Getting Started
 
-This tutorial demonstrates the workflow of `mievformer` package for nicheformer analysis.
+This tutorial demonstrates the complete workflow of the `mievformer` package for microenvironmental analysis.
 
 ## 1. Setup and Data Loading
 
@@ -20,7 +20,7 @@ original_data_path = "nichedynamics/data/20230629__230629pre/output-XETG00057__0
 if os.path.exists(original_data_path):
     adata = sc.read_h5ad(original_data_path)
     print(f"Loaded data with {adata.shape[0]} cells and {adata.shape[1]} genes.")
-    
+
     # Subsample to 10k cells for tutorial
     if adata.shape[0] > 10000:
         sc.pp.subsample(adata, n_obs=10000)
@@ -36,9 +36,9 @@ else:
 
 ```
 
-## 2. Optimize NicheFormer Model
+## 2. Optimize Mievformer Model
 
-We optimize the NicheFormer model to learn the niche representation. This step involves training a model to reconstruct the cellular neighborhood.
+We optimize the Mievformer model to learn the niche representation. This step involves training a model to reconstruct the cellular neighborhood.
 
 
 ```python
@@ -48,7 +48,7 @@ model_path = "tutorial_model.pth"
 # Optimize model
 # We use a small number of epochs for demonstration purposes
 adata = mf.optimize_nicheformer(
-    adata, 
+    adata,
     model_path=model_path,
     max_epochs=10,  # Increase for real analysis
     batch_size=128,
@@ -114,8 +114,8 @@ density_col = f'{target_group}_density'
 output_plot = "density_correlation.png"
 
 corrs = mf.analyze_density_correlation(
-    adata, 
-    density_col=density_col, 
+    adata,
+    density_col=density_col,
     file_path=output_plot
 )
 
@@ -130,7 +130,7 @@ print(corrs.nlargest(5))
 # In the documentation build, we display the pre-generated image:
 ```
 
-![Density Correlation](_static/images/density_correlation.png)
+![Density Correlation](../_static/images/density_correlation.png)
 
 ## 7. Analyze Niche Composition
 
@@ -164,4 +164,18 @@ print("Added 'niche_cluster' to obs:", 'niche_cluster' in adata.obs)
 #     display(Image(filename='niche_composition_clustermap.png'))
 ```
 
-![Niche Composition Clustermap](_static/images/niche_composition_clustermap.png)
+![Niche Composition Clustermap](../_static/images/niche_composition_clustermap.png)
+
+## Summary
+
+In this tutorial, we covered the complete Mievformer workflow:
+
+1. **Data Loading**: Load and preprocess spatial transcriptomics data
+2. **Model Training**: Use `optimize_nicheformer` to learn microenvironmental embeddings
+3. **Embedding Calculation**: Use `calculate_wb_ez` to compute weight and bias terms
+4. **Spatial Distribution**: Use `calculate_spatial_distribution` and `aggregate_dist_e` for distribution analysis
+5. **Density Estimation**: Use `estimate_population_density` to estimate cell population density
+6. **Correlation Analysis**: Use `analyze_density_correlation` to find correlated genes
+7. **Niche Composition**: Use `analyze_niche_composition` to cluster and visualize niches
+
+For more details on each function, see the [API Reference](../api.rst).
