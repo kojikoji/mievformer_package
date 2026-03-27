@@ -30,7 +30,7 @@ For each cell $i$, the embedding $e_i$ is computed from the cell states $\{z_j \
 
 Mievformer employs a masked self-supervised learning framework to compute the probability of observing a central cell state given its surrounding cellular context, and maximizes this probability during training. The architecture comprises two main components: **NicheEncoder** and **Distributor**.
 
-*   **NicheEncoder**: Constructs the input sequence by placing a learnable mask token at the central cell position. It processes this sequence through multiple Transformer encoder layers. The final hidden state of the mask token is mapped to the mean $\mu_i$ and standard deviation $\sigma_i$ of a Gaussian distribution over microenvironmental embeddings.
+*   **NicheEncoder**: Constructs the input sequence by placing a learnable mask token at the central cell position. It processes this sequence through multiple Transformer encoder layers. The final hidden state of the mask token is mapped to the microenvironmental embedding $e_i$.
 *   **Distributor**: Computes the probability that each cell embedding $z_j$ in the mini-batch could be observed at the central position given microenvironment $e_i$.
 
 The training objective maximizes the likelihood that the observed central cell state $z_i$ is generated from its inferred microenvironment $e_i$. This formulation corresponds to the InfoNCE loss, maximizing mutual information between paired observations.
