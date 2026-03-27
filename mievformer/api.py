@@ -71,9 +71,7 @@ def optimize_nicheformer(adata, model_path, ngpu=1, batch_size=512, max_epochs=1
     -------
     anndata.AnnData
         The input AnnData object updated with the following fields:
-        - `obsm['e']`: Microenvironmental embeddings (mean of the variational distribution).
-        - `obsm['mu']`: Mean of the variational distribution.
-        - `obsm['sigma']`: Standard deviation of the variational distribution.
+        - `obsm['e']`: Microenvironmental embeddings.
         - `obs['leiden_e']`: Leiden clusters of the microenvironmental embeddings.
     """
     adata = adata.copy()
@@ -148,8 +146,6 @@ def optimize_nicheformer(adata, model_path, ngpu=1, batch_size=512, max_epochs=1
     ds = wl.adata2ds(adata, neighbor_num=neighbor_num, batch_key=batch_key)
     e, mu, sigma = wl.output_dist_params(ds, model)
     adata.obsm['e'] = e.numpy()
-    adata.obsm['mu'] = mu.numpy()
-    adata.obsm['sigma'] = sigma.numpy()
     
     # Clustering
     sc.pp.neighbors(adata, use_rep='e', n_neighbors=neighbor_num)
@@ -210,8 +206,6 @@ def calculate_wb_ez(adata, model_path, batch_key=None, neighbor_num=100, latent_
         ds = wl.adata2ds(adata, neighbor_num=neighbor_num, batch_key=batch_key)
         e, mu, sigma = wl.output_dist_params(ds, model)
         adata.obsm['e'] = e.numpy()
-        adata.obsm['mu'] = mu.numpy()
-        adata.obsm['sigma'] = sigma.numpy()
     
     wl.add_wb_ez(adata, model, cell_rep_key='nf_cellrep')
     return adata
