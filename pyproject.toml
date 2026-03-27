@@ -5,12 +5,32 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mievformer"
 version = "0.1.0"
-description = "A package for nicheformer analysis"
+description = "A deep learning model for microenvironment estimation based on spatial transcriptomics"
 readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "MIT License"}
 authors = [
-  {name = "Your Name", email = "your.email@example.com"},
+  {name = "Yasuhiro Kojima", email = "tiisaishima@gmail.com"},
+]
+keywords = [
+    "spatial-transcriptomics",
+    "deep-learning",
+    "single-cell",
+    "microenvironment",
+    "niche",
+    "transformer",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
     "torch",
@@ -40,5 +60,6 @@ packages = ["mievformer"]
 
 
 [project.urls]
-"Homepage" = "https://github.com/nichedynamics/nicheformer"
-"Bug Tracker" = "https://github.com/nichedynamics/nicheformer/issues"
+"Homepage" = "https://github.com/kojikoji/mievformer_package"
+"Repository" = "https://github.com/kojikoji/mievformer_package"
+"Bug Tracker" = "https://github.com/kojikoji/mievformer_package/issues"
