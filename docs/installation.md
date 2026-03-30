@@ -5,7 +5,7 @@
 Mievformer requires Python 3.9 or later. The following dependencies will be installed automatically:
 
 - PyTorch >= 2.0
-- NumPy
+- NumPy (<2.0 recommended for PyTorch compatibility)
 - Pandas
 - Scanpy
 - AnnData
@@ -14,6 +14,17 @@ Mievformer requires Python 3.9 or later. The following dependencies will be inst
 - matplotlib
 - seaborn
 - scipy
+
+### Optional Dependencies
+
+For full functionality, the following packages are recommended:
+
+- **igraph** and **leidenalg**: Required for Leiden clustering in Scanpy
+- **tensorboard**: Required for training visualization and logging
+
+```bash
+pip install igraph leidenalg tensorboard
+```
 
 ## Installation via pip
 
@@ -49,6 +60,63 @@ Then install Mievformer:
 
 ```bash
 pip install mievformer
+```
+
+## Docker Installation
+
+For a reproducible environment with all dependencies pre-configured, you can use Docker:
+
+### Building the Docker Image
+
+```bash
+cd mievformer_package
+docker build -t mievformer .
+```
+
+### Running with GPU Support
+
+Requires NVIDIA Container Toolkit to be installed on the host system.
+
+```bash
+docker run --gpus all -it mievformer
+```
+
+### Running the Tutorial
+
+```bash
+docker run --gpus all mievformer python run_tutorial.py
+```
+
+### Interactive Mode
+
+```bash
+docker run --gpus all -it mievformer bash
+```
+
+## Troubleshooting
+
+### NumPy Compatibility
+
+If you encounter errors related to NumPy 2.x incompatibility with PyTorch, downgrade NumPy:
+
+```bash
+pip install "numpy<2"
+```
+
+### Missing igraph/leidenalg
+
+If Leiden clustering fails with an import error, install the required packages:
+
+```bash
+pip install igraph leidenalg
+```
+
+### TensorBoard Not Found
+
+If training fails with a TensorBoard error, install it:
+
+```bash
+pip install tensorboard
 ```
 
 ## Verifying Installation

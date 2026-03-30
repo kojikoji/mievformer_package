@@ -1,0 +1,45 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv
+venv/
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Development
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+lightning_logs/
+
+# Documentation
+docs/
+
+# Tests
+tests/
+
+# Lock files
+uv.lock
+
+# Checkpoints (keep tutorial_model.pth only)
+ckpt/
