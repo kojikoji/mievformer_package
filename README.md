@@ -5,20 +5,15 @@ mievformer is a Python package for nicheformer analysis, providing tools for spa
 ## Installation
 
 ```bash
-pip install .
+pip install mievformer
 ```
 
-## Usage
+## Documentation
 
-See the tutorial notebook for detailed usage examples.
+For detailed usage instructions, tutorials, and API reference, please visit the documentation:
 
-```python
-import mievformer as mf
-import scanpy as sc
+**https://kojikoji.github.io/mievformer_package/index.html**
 
-# Load your data
-adata = sc.read_h5ad("path/to/your/data.h5ad")
+## License
 
-# Optimize model
-adata = mf.optimize_nicheformer(adata, ...)
-```
+MIT License
