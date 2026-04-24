@@ -72,18 +72,18 @@ print("Embedding 'e' shape:", adata.obsm['e'].shape)
 print("Weights 'w_z' shape:", adata.obsm['w_z'].shape)
 ```
 
-## 4. Spatial Distribution and Aggregation
+## 4. Niche Density Ratio and Cluster Membership
 
-Calculate the spatial distribution of cells and aggregate the embeddings.
+For each cell, compute the density ratio `p(e|z)/p(e)` over a panel of reference niches (softmax-normalized per cell), then aggregate by niche cluster to obtain a per-cell soft membership over niche clusters.
 
 
 ```python
-# Calculate spatial distribution
-adata = mf.calculate_spatial_distribution(adata)
+# Per-cell density ratio over reference niches
+adata = mf.calculate_niche_density_ratio(adata)
 
-# Aggregate distribution embedding
-adata = mf.aggregate_dist_e(adata)
-print("Spatial distribution calculated.")
+# Aggregate into per-cell niche-cluster membership
+adata = mf.calculate_niche_cluster_membership(adata)
+print("Niche density ratio and cluster membership computed.")
 ```
 
 ## 5. Estimate Population Density
@@ -132,31 +132,29 @@ print(corrs.nlargest(5))
 
 ![Density Correlation](../_static/images/density_correlation.png)
 
-## 7. Analyze Niche Composition
+## 7. Analyze Niche Membership
 
-Cluster niches based on their cell type composition and visualize the result.
+Cluster cells by their niche-cluster membership vectors (`obsm['dist_e_agg']`) and visualize the membership matrix as a clustermap.
 
 
 ```python
-# Analyze niche composition
-# This function clusters the niches (e.g., 'leiden_e') based on the composition of cell types within them.
-# It also generates a clustermap visualization.
+# Analyze niche membership
+# Cluster cells using Ward hierarchical clustering on the niche-cluster
+# membership vectors, and draw a clustermap.
 
-# Ensure we have the necessary keys. 'leiden_e' is usually added by optimize_nicheformer or subsequent clustering.
-# If not present, we might need to run clustering on 'e' or 'dist_e'.
 if 'leiden_e' not in adata.obs:
     print("Running Leiden clustering on 'e' embedding...")
     sc.pp.neighbors(adata, use_rep='e')
     sc.tl.leiden(adata, key_added='leiden_e')
 
-adata = mf.analyze_niche_composition(
+adata = mf.analyze_niche_membership(
     adata,
-    n_clusters=3, # Number of meta-clusters for niches
+    n_clusters=3,  # Number of cell clusters based on niche membership
     file_path='niche_composition_clustermap.png'
 )
 
-print("Niche composition analysis complete.")
-print("Added 'niche_cluster' to obs:", 'niche_cluster' in adata.obs)
+print("Niche membership analysis complete.")
+print("Added 'niche_composition_cluster' to obs:", 'niche_composition_cluster' in adata.obs)
 
 # Display the plot
 # from IPython.display import Image
@@ -173,9 +171,9 @@ In this tutorial, we covered the complete Mievformer workflow:
 1. **Data Loading**: Load and preprocess spatial transcriptomics data
 2. **Model Training**: Use `optimize_nicheformer` to learn microenvironmental embeddings
 3. **Embedding Calculation**: Use `calculate_wb_ez` to compute weight and bias terms
-4. **Spatial Distribution**: Use `calculate_spatial_distribution` and `aggregate_dist_e` for distribution analysis
+4. **Niche Density Ratio and Membership**: Use `calculate_niche_density_ratio` and `calculate_niche_cluster_membership` to compute per-cell p(e|z)/p(e) over reference niches and aggregate it into a per-cell niche-cluster membership
 5. **Density Estimation**: Use `estimate_population_density` to estimate cell population density
 6. **Correlation Analysis**: Use `analyze_density_correlation` to find correlated genes
-7. **Niche Composition**: Use `analyze_niche_composition` to cluster and visualize niches
+7. **Niche Membership Analysis**: Use `analyze_niche_membership` to cluster cells by niche membership and visualize
 
 For more details on each function, see the [API Reference](../api.rst).

@@ -36,8 +36,12 @@ Basic usage example:
    # Calculate embeddings for downstream analysis
    adata = mf.calculate_wb_ez(adata, "model.pth")
 
-   # Analyze niche composition
-   adata = mf.analyze_niche_composition(adata, file_path="niche_composition.png")
+   # Compute niche density ratio and per-cell niche-cluster membership
+   adata = mf.calculate_niche_density_ratio(adata)
+   adata = mf.calculate_niche_cluster_membership(adata)
+
+   # Cluster cells by niche membership and visualize
+   adata = mf.analyze_niche_membership(adata, file_path="niche_composition.png")
 
 
 Contents

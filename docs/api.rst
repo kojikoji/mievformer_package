@@ -13,14 +13,15 @@ Functions for training the Mievformer model and computing embeddings.
 .. autofunction:: mievformer.calculate_wb_ez
 
 
-Distribution Analysis
----------------------
+Niche Density Ratio and Membership
+----------------------------------
 
-Functions for computing and aggregating spatial distributions.
+Functions for computing the per-cell niche density ratio p(e|z)/p(e) and
+aggregating it into a per-cell soft membership over niche clusters.
 
-.. autofunction:: mievformer.calculate_spatial_distribution
+.. autofunction:: mievformer.calculate_niche_density_ratio
 
-.. autofunction:: mievformer.aggregate_dist_e
+.. autofunction:: mievformer.calculate_niche_cluster_membership
 
 
 Downstream Analysis
@@ -32,4 +33,4 @@ Functions for biological interpretation and visualization.
 
 .. autofunction:: mievformer.analyze_density_correlation
 
-.. autofunction:: mievformer.analyze_niche_composition
+.. autofunction:: mievformer.analyze_niche_membership

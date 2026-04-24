@@ -62,12 +62,12 @@ model.load_state_dict(torch.load(model_path))
 # Calculate wb_ez (required for spatial distribution)
 adata = mf.calculate_wb_ez(adata, model_path)
 
-# Calculate spatial distribution
-adata = mf.calculate_spatial_distribution(adata)
+# Compute per-cell niche density ratio
+adata = mf.calculate_niche_density_ratio(adata)
 
-# Aggregate distribution embedding
-adata = mf.aggregate_dist_e(adata)
-print("Spatial distribution calculated.")
+# Aggregate into per-cell niche-cluster membership
+adata = mf.calculate_niche_cluster_membership(adata)
+print("Niche density ratio and cluster membership computed.")
 
 # Estimate density for a specific group (e.g., the first one found)
 target_group = adata.obs['cell_type'].unique()[0]
@@ -97,10 +97,10 @@ if 'leiden_e' not in adata.obs:
     sc.pp.neighbors(adata, use_rep='e')
     sc.tl.leiden(adata, key_added='leiden_e')
 
-adata = mf.analyze_niche_composition(
+adata = mf.analyze_niche_membership(
     adata,
-    n_clusters=3, # Number of meta-clusters for niches
+    n_clusters=3, # Number of cell clusters based on niche membership
     file_path='niche_composition_clustermap.png'
 )
 
-print("Niche composition analysis complete.")
+print("Niche membership analysis complete.")

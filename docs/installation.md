@@ -131,7 +131,7 @@ print(mf.__all__)
 This should print the list of available functions:
 
 ```
-['optimize_nicheformer', 'calculate_wb_ez', 'calculate_spatial_distribution',
- 'aggregate_dist_e', 'estimate_population_density', 'analyze_density_correlation',
- 'analyze_niche_composition']
+['optimize_nicheformer', 'calculate_wb_ez', 'calculate_niche_density_ratio',
+ 'calculate_niche_cluster_membership', 'estimate_population_density',
+ 'analyze_density_correlation', 'analyze_niche_membership', '__version__']
 ```
