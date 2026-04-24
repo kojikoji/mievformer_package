@@ -49,51 +49,44 @@ def test_calculate_wb_ez(dummy_adata, dummy_model_path, dummy_model_params):
     # 'e' should be calculated if not present
     assert 'e' in adata.obsm 
 
-def test_calculate_spatial_distribution(dummy_adata, dummy_model_path, dummy_model_params):
-    # calculate_spatial_distribution requires w_z, b_z which come from calculate_wb_ez
+def test_calculate_niche_density_ratio(dummy_adata, dummy_model_path, dummy_model_params):
+    # calculate_niche_density_ratio requires w_z, b_z which come from calculate_wb_ez
     # So we run calculate_wb_ez first
     latent_dim = dummy_model_params['latent_dim']
     neighbor_num = dummy_model_params['neighbor_num']
-    
+
     adata = api.calculate_wb_ez(
-        dummy_adata, 
-        dummy_model_path, 
-        neighbor_num=neighbor_num, 
-        latent_dim=latent_dim, 
+        dummy_adata,
+        dummy_model_path,
+        neighbor_num=neighbor_num,
+        latent_dim=latent_dim,
         cellrep_key='X_pca'
     )
-    
-    # api.calculate_spatial_distribution now wraps wl.calculate_spatial_distribution
-    # It does not require the model object anymore, but requires w_z (added by calculate_wb_ez)
-    
-    adata = api.calculate_spatial_distribution(adata, ref_num=10, stratify_key='leiden_e')
-    
-    # api.calculate_spatial_distribution wraps wl.calculate_spatial_distribution which adds 'dist_e'
+
+    adata = api.calculate_niche_density_ratio(adata, ref_num=10, stratify_key='leiden_e')
+
+    # writes softmax-normalized density ratios to obsm['dist_e'] and ref obs names to uns['dist_e']
     assert 'dist_e' in adata.obsm
     assert 'dist_e' in adata.uns
 
-def test_aggregate_dist_e(dummy_adata, dummy_model_path, dummy_model_params):
+def test_calculate_niche_cluster_membership(dummy_adata, dummy_model_path, dummy_model_params):
     # Setup prerequisites
     latent_dim = dummy_model_params['latent_dim']
     neighbor_num = dummy_model_params['neighbor_num']
     api.calculate_wb_ez(
-        dummy_adata, 
-        dummy_model_path, 
-        neighbor_num=neighbor_num, 
-        latent_dim=latent_dim, 
+        dummy_adata,
+        dummy_model_path,
+        neighbor_num=neighbor_num,
+        latent_dim=latent_dim,
         cellrep_key='X_pca'
     )
-    
+
     # Ensure cluster key exists (added in conftest)
     cluster_key = 'leiden_e'
-    
-    adata = api.aggregate_dist_e(dummy_adata, cluster_key=cluster_key)
-    
+
+    adata = api.calculate_niche_cluster_membership(dummy_adata, cluster_key=cluster_key)
+
     assert 'dist_e_agg' in adata.obsm
-    # Check shape: (n_obs, n_clusters) roughly, but it depends on implementation
-    # dist_e_agg is transposed in workflow.py: adata.obsm['dist_e_agg'] = dist_e_agg.transpose()
-    # Wait, let's check workflow.py implementation again if needed.
-    # But existence is enough for now.
 
 def test_estimate_population_density(dummy_adata, dummy_model_path, dummy_model_params):
     # Setup prerequisites
@@ -139,29 +132,29 @@ def test_analyze_density_correlation_sparse(dummy_adata):
     assert len(corrs) == dummy_adata.shape[1]
     assert isinstance(corrs, pd.Series)
 
-def test_analyze_niche_composition(dummy_adata, dummy_model_path, dummy_model_params, tmp_path):
+def test_analyze_niche_membership(dummy_adata, dummy_model_path, dummy_model_params, tmp_path):
     # Setup prerequisites
     latent_dim = dummy_model_params['latent_dim']
     neighbor_num = dummy_model_params['neighbor_num']
     api.calculate_wb_ez(
-        dummy_adata, 
-        dummy_model_path, 
-        neighbor_num=neighbor_num, 
-        latent_dim=latent_dim, 
+        dummy_adata,
+        dummy_model_path,
+        neighbor_num=neighbor_num,
+        latent_dim=latent_dim,
         cellrep_key='X_pca'
     )
-    
+
     # Need dist_e_agg
     cluster_key = 'leiden_e'
     # Ensure cluster key exists
     if cluster_key not in dummy_adata.obs:
         dummy_adata.obs[cluster_key] = np.random.choice(['c1', 'c2'], dummy_adata.shape[0])
-        
-    api.aggregate_dist_e(dummy_adata, cluster_key=cluster_key)
-    
+
+    api.calculate_niche_cluster_membership(dummy_adata, cluster_key=cluster_key)
+
     file_path = str(tmp_path / "niche_composition.png")
-    
-    adata = api.analyze_niche_composition(dummy_adata, n_clusters=3, file_path=file_path)
-    
+
+    adata = api.analyze_niche_membership(dummy_adata, n_clusters=3, file_path=file_path)
+
     assert 'niche_composition_cluster' in adata.obs
     assert os.path.exists(file_path)

@@ -654,21 +654,49 @@ def estimate_population_density(adata, group, cluster_key, max_cell_num=1000):
 
 
 
-def calculate_spatial_distribution(adata, ref_niche_num, stratify_key='leiden_e', min_ratio=0.01, ref_adata=None):
+def calculate_niche_density_ratio(adata, ref_niche_num, stratify_key='leiden_e', min_ratio=0.01, ref_adata=None):
     """
-    Perform calculation of spatial distributions across given number of niches.
-    
+    Compute per-cell density ratios over a panel of reference niches.
+
+    For each cell ``i`` and reference niche ``j`` sampled by stratified
+    sampling on ``stratify_key``, the log density ratio is
+
+    .. math::
+        \\log r_{ij}
+        = \\log p(e_j \\mid z_i) - \\log p(e_j)
+        = (w_z(z_i)^\\top w_e(e_j) + b_z(z_i))
+          - \\log \\sum_{k \\in \\mathrm{ref}}
+            \\exp(w_z(z_k)^\\top w_e(e_j) + b_z(z_k)).
+
+    The matrix is then softmax-normalized per cell over reference niches, so
+    each row of ``adata.obsm['dist_e']`` is a probability distribution over
+    the sampled reference niches that emphasizes niches whose environment
+    becomes more likely under the cell's state than under the marginal.
+
     Parameters
     ----------
     adata : AnnData
-        The annotated data matrix.
+        The annotated data matrix. Must contain ``w_e``, ``w_z``, ``b_z`` in
+        ``obsm`` (produced by :func:`add_wb_ez`).
     ref_niche_num : int
-        The number of reference niches to use for caluculaiton of spatial distributions.
-    
+        Number of reference niches to sample.
+    stratify_key : str, optional
+        ``adata.obs`` column used for stratified sampling. Default ``'leiden_e'``.
+    min_ratio : float, optional
+        Clusters with frequency below this fraction of the dataset are dropped
+        from stratified sampling. Default ``0.01``.
+    ref_adata : AnnData, optional
+        External reference. If ``None``, reference niches are drawn from ``adata``.
+
     Returns
     -------
     adata : AnnData
-        The updated annotated data matrix with clustering information. The spatial distribution is stored in adata.obsm['dist_e']. The obs_names of reference niche point is stored in uns['dist_e']['ref_obs'].
+        Updated in-place with
+        ``obsm['dist_e']`` — softmax-normalized density ratios of shape
+        ``(n_cells, ref_niche_num)`` — and
+        ``uns['dist_e']['ref_obs']`` — obs names of the sampled reference niches.
+        The ``dist_e`` key name is preserved for backward compatibility with
+        existing h5ad artifacts.
     """
     if 'w_z' not in adata.obsm.keys():
         raise ValueError("w_z is not found in adata.obsm. Please run add_wb_ez first.")
@@ -711,7 +739,7 @@ def calculate_niche_communication_strength(adata, niche_cluster_key='leiden_e', 
     niche_cluster_key : str, default 'leiden_e'
         The key for niche clustering in adata.obs.
     ref_niche_num : int, default 1000
-        Number of reference niches used in spatial distribution calculation.
+        Number of reference niches used when computing the niche density ratio.
     
     Returns
     -------
@@ -719,7 +747,7 @@ def calculate_niche_communication_strength(adata, niche_cluster_key='leiden_e', 
         A matrix of communication strengths between niche clusters.
     """
     if 'dist_e_agg' not in adata.obsm.keys():
-        raise ValueError("dist_e_agg is not found in adata.obsm. Please run post_process_nicheformer first.")
+        raise ValueError("dist_e_agg is not found in adata.obsm. Please run calculate_niche_cluster_membership first.")
     
     dist_e_agg = adata.obsm['dist_e_agg']
     unique_clusters = adata.obs[niche_cluster_key].unique()
@@ -768,25 +796,37 @@ def calculate_niche_specificity_scores(adata, niche_cluster_key='leiden_e', ref_
     return adata
 
 
-def aggregate_dist_e(adata, group_key='leiden_e'):
+def calculate_niche_cluster_membership(adata, group_key='leiden_e'):
     """
-    Perform aggregation of spatial distributions based on a given group key.
-    
+    Aggregate per-cell density ratios into a soft membership over niche clusters.
+
+    Averages the columns of ``adata.obsm['dist_e']`` within each value of
+    ``adata.obs[group_key]`` (typically ``leiden_e`` niche clusters). The
+    resulting ``adata.obsm['dist_e_agg']`` has shape
+    ``(n_cells, n_niche_clusters)``; entry ``[i, c]`` is the mean density
+    ratio ``p(e|z_i)/p(e)`` evaluated at reference cells in cluster ``c``
+    and is used as a soft assignment of cell ``i`` to niche cluster ``c``.
+
     Parameters
     ----------
     adata : AnnData
-        The annotated data matrix.
-    group_key : str
-        The key for the grouping information in adata.obs.
-    
+        The annotated data matrix. Must contain ``obsm['dist_e']`` (see
+        :func:`calculate_niche_density_ratio`). If absent, that function is
+        invoked with defaults.
+    group_key : str, optional
+        ``adata.obs`` column with niche cluster labels. Default ``'leiden_e'``.
+
     Returns
     -------
     adata : AnnData
-        The updated annotated data matrix with aggregated spatial distributions.
+        Updated with ``obsm['dist_e_agg']``: per-cell niche-cluster membership
+        vectors (columns are niche cluster labels). The ``dist_e_agg`` key
+        name is preserved for backward compatibility with existing h5ad
+        artifacts used by figure scripts.
     """
     if 'dist_e' not in adata.obsm.keys():
-        adata = calculate_spatial_distribution(adata, ref_niche_num=1000, stratify_key=group_key)
-        print("Spatial distribution calculated and stored in adata.obsm['dist_e'].")
+        adata = calculate_niche_density_ratio(adata, ref_niche_num=1000, stratify_key=group_key)
+        print("Niche density ratio calculated and stored in adata.obsm['dist_e'].")
     dist_e = adata.obsm['dist_e']
     dist_e_agg = pd.DataFrame(dist_e, index=adata.obs_names, columns=adata.uns['dist_e']['ref_obs']).transpose()
     dist_e_agg['group'] = adata[dist_e_agg.index].obs[group_key].values
@@ -942,7 +982,7 @@ def sample_cells_by_exression(adata, gene, sample_cells=1000):
     sampled_cells = np.random.choice(adata.obs_names, size=sample_cells, replace=True, p=probs)
     return sampled_cells
 
-def cluster_niche_composition(adata, n_clusters=15, use_rep='dist_e_agg', key_added='niche_composition_cluster'):
+def cluster_cells_by_niche_membership(adata, n_clusters=15, use_rep='dist_e_agg', key_added='niche_composition_cluster'):
     from scipy.cluster.hierarchy import linkage, fcluster
     if use_rep not in adata.obsm:
         raise ValueError(f"{use_rep} not found in adata.obsm")
@@ -963,7 +1003,7 @@ def cluster_niche_composition(adata, n_clusters=15, use_rep='dist_e_agg', key_ad
     adata.obs[key_added] = labels.astype(str)
     return adata
 
-def visualize_niche_composition(adata, cluster_key='niche_composition_cluster', use_rep='dist_e_agg', file_path=None):
+def plot_niche_membership_clustermap(adata, cluster_key='niche_composition_cluster', use_rep='dist_e_agg', file_path=None):
     import seaborn as sns
     import matplotlib.pyplot as plt
     from matplotlib.patches import Patch

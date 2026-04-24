@@ -210,57 +210,82 @@ def calculate_wb_ez(adata, model_path, batch_key=None, neighbor_num=100, latent_
     wl.add_wb_ez(adata, model, cell_rep_key='nf_cellrep')
     return adata
 
-def calculate_spatial_distribution(adata, ref_num=1000, stratify_key='leiden_e', min_ratio=0.01, ref_adata=None):
+def calculate_niche_density_ratio(adata, ref_num=1000, stratify_key='leiden_e', min_ratio=0.01, ref_adata=None):
     """
-    Calculate the spatial distribution of cell states conditioned on microenvironments.
+    Compute per-cell density ratios over a panel of reference niches.
 
-    This function computes the conditional probability :math:`P(z|e)` for cells in the dataset.
-    It effectively estimates the likelihood of observing specific cell states in the inferred 
-    microenvironments.
+    For each cell :math:`i` and reference niche :math:`j` drawn by stratified
+    sampling on ``stratify_key``, the log density ratio is
+
+    .. math::
+        \\log r_{ij}
+        = \\log p(e_j \\mid z_i) - \\log p(e_j)
+        = (w_z(z_i)^\\top w_e(e_j) + b_z(z_i))
+          - \\log \\sum_{k \\in \\mathrm{ref}}
+            \\exp(w_z(z_k)^\\top w_e(e_j) + b_z(z_k)).
+
+    The matrix is then softmax-normalized per cell over reference niches,
+    so each row of ``adata.obsm['dist_e']`` is a probability distribution
+    over the sampled reference niches that emphasizes niches whose
+    environment becomes more likely under the cell's state than under the
+    marginal.
 
     Parameters
     ----------
     adata : anndata.AnnData
-        Annotated data matrix containing `w_e`, `w_z`, and `b_z` in `obsm`.
+        Annotated data matrix containing ``w_e``, ``w_z``, and ``b_z`` in ``obsm``
+        (produced by :func:`calculate_wb_ez`).
     ref_num : int, optional
-        Number of reference niches to use for calculation of spatial distributions. Default is 1000.
+        Number of reference niches to sample. Default is 1000.
     stratify_key : str, optional
-        Key in `adata.obs` to use for stratified sampling of reference niches. Default is 'leiden_e'.
+        Key in ``adata.obs`` to use for stratified sampling of reference niches.
+        Default is 'leiden_e'.
     min_ratio : float, optional
-        Minimum ratio of cells in a cluster to be considered for stratified sampling. Default is 0.01.
+        Clusters with frequency below this fraction are dropped from stratified
+        sampling. Default is 0.01.
     ref_adata : anndata.AnnData, optional
-        Reference AnnData object to use for calculation. If None, a subset of `adata` is used. Default is None.
+        External reference. If ``None``, a subset of ``adata`` is used.
 
     Returns
     -------
     anndata.AnnData
-        The input AnnData object updated with spatial distribution information in `obsm['dist_e']`.
+        Updated with ``obsm['dist_e']`` (softmax-normalized density ratios of
+        shape ``(n_cells, ref_num)``) and ``uns['dist_e']['ref_obs']`` (obs
+        names of the sampled reference niches). The ``dist_e`` key name is
+        preserved for backward compatibility with existing h5ad artifacts.
     """
-    wl.calculate_spatial_distribution(adata, ref_niche_num=ref_num, stratify_key=stratify_key, min_ratio=min_ratio, ref_adata=ref_adata)
+    wl.calculate_niche_density_ratio(adata, ref_niche_num=ref_num, stratify_key=stratify_key, min_ratio=min_ratio, ref_adata=ref_adata)
     return adata
 
-def aggregate_dist_e(adata, cluster_key='leiden_e'):
+def calculate_niche_cluster_membership(adata, cluster_key='leiden_e'):
     """
-    Aggregate distribution embeddings based on microenvironmental clusters.
+    Aggregate per-cell density ratios into a soft membership over niche clusters.
 
-    This function aggregates the conditional probabilities (or related distribution embeddings)
-    for each microenvironmental cluster identified by `cluster_key`. This allows for the 
-    characterization of cell subpopulations based on their microenvironmental distribution profiles.
+    Averages the columns of ``adata.obsm['dist_e']`` within each value of
+    ``adata.obs[cluster_key]`` (typically ``leiden_e`` niche clusters),
+    yielding ``adata.obsm['dist_e_agg']`` of shape
+    ``(n_cells, n_niche_clusters)``: entry ``[i, c]`` is the mean density
+    ratio :math:`p(e \\mid z_i)/p(e)` evaluated at reference cells in cluster
+    ``c``, interpretable as a soft assignment of cell ``i`` to niche cluster ``c``.
 
     Parameters
     ----------
     adata : anndata.AnnData
-        Annotated data matrix containing distribution embeddings.
+        Annotated data matrix containing ``obsm['dist_e']`` (see
+        :func:`calculate_niche_density_ratio`). If absent, it is computed
+        with defaults.
     cluster_key : str, optional
-        Key in `adata.obs` containing the microenvironmental cluster labels. 
-        Default is 'leiden_e'.
+        Key in ``adata.obs`` containing niche cluster labels. Default is 'leiden_e'.
 
     Returns
     -------
     anndata.AnnData
-        The input AnnData object updated with aggregated distribution information.
+        Updated with ``obsm['dist_e_agg']``: per-cell niche-cluster membership
+        (columns are niche cluster labels). The ``dist_e_agg`` key name is
+        preserved for backward compatibility with existing h5ad artifacts
+        used by figure scripts.
     """
-    wl.aggregate_dist_e(adata, group_key=cluster_key)
+    wl.calculate_niche_cluster_membership(adata, group_key=cluster_key)
     return adata
 
 def estimate_population_density(adata, group, cluster_key, max_cell_num=1000):
@@ -363,31 +388,33 @@ def analyze_density_correlation(adata, density_col, gene_list=None, file_path=No
         
     return corrs
 
-def analyze_niche_composition(adata, n_clusters=15, file_path=None):
+def analyze_niche_membership(adata, n_clusters=15, file_path=None):
     """
-    Perform clustering based on niche composition and visualize the result.
+    Cluster cells by their niche-cluster membership vectors and visualize the result.
 
-    This function clusters the microenvironments (niches) based on the composition of cell types 
-    within them. It generates a clustermap visualization to reveal distinct microenvironmental 
-    patterns (e.g., tumor-dominant, immune-enriched, stromal).
+    Uses ``adata.obsm['dist_e_agg']`` (per-cell soft membership over niche
+    clusters produced by :func:`calculate_niche_cluster_membership`) as the
+    feature space, performs Ward hierarchical clustering to partition cells
+    into ``n_clusters`` groups, and draws a clustermap of the membership
+    matrix with row-color annotations.
 
     Parameters
     ----------
     adata : anndata.AnnData
-        Annotated data matrix containing niche information (e.g., 'leiden_e').
+        Annotated data matrix containing ``obsm['dist_e_agg']``.
     n_clusters : int, optional
-        Number of clusters to form for the niche composition analysis. Default is 15.
+        Number of cell clusters to form. Default is 15.
     file_path : str, optional
-        Path to save the resulting clustermap image. If None, the plot is not saved.
+        Path to save the resulting clustermap image. If ``None``, the plot is
+        not saved.
 
     Returns
     -------
-    None
-        The function updates `adata` in-place (adding 'niche_cluster' to `obs`) and optionally 
-        saves a plot.
+    anndata.AnnData
+        The input AnnData with ``obs['niche_composition_cluster']`` added
+        (cell cluster labels). The ``niche_composition_cluster`` key name is
+        preserved for backward compatibility with existing h5ad artifacts.
     """
-    wl.cluster_niche_composition(adata, n_clusters=n_clusters)
-    wl.visualize_niche_composition(adata, file_path=file_path)
-    if file_path:
-        wl.visualize_niche_composition(adata, file_path=file_path)
+    wl.cluster_cells_by_niche_membership(adata, n_clusters=n_clusters)
+    wl.plot_niche_membership_clustermap(adata, file_path=file_path)
     return adata
