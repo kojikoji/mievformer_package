@@ -27,9 +27,13 @@ def test_optimize_nicheformer(dummy_adata, tmp_path):
     
     assert os.path.exists(model_path)
     assert 'e' in adata.obsm
-    assert 'mu' in adata.obsm
-    assert 'sigma' in adata.obsm
-    assert 'leiden_e' in adata.obs # optimize_nicheformer adds this
+    assert 'mievformer_raw_e' in adata.obsm
+    assert 'reference_probability_ca' in adata.obsm
+    assert 'X_umap' in adata.obsm
+    assert 'leiden_e' in adata.obs
+    np.testing.assert_array_equal(
+        adata.obsm['e'], adata.obsm['reference_probability_ca']
+    )
 
 def test_calculate_wb_ez(dummy_adata, dummy_model_path, dummy_model_params):
     latent_dim = dummy_model_params['latent_dim']

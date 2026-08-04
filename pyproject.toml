@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mievformer"
-version = "0.2.0"
+version = "0.3.0"
 description = "A deep learning model for microenvironment estimation based on spatial transcriptomics"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -36,6 +36,8 @@ dependencies = [
     "torch",
     "pytorch-lightning",
     "scanpy",
+    "igraph",
+    "leidenalg",
     "anndata",
     "numpy",
     "pandas",

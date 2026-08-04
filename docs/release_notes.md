@@ -1,5 +1,42 @@
 # Release Notes
 
+## Version 0.3.0 (2026)
+
+### Changed
+
+- `optimize_nicheformer` now uses reference-probability correspondence analysis
+  (CA) as the standard representation for neighbors, UMAP, and Leiden niche
+  clustering.
+- `obsm['e']` now aliases the standard CA scores. The former neural-network
+  embedding is retained in `obsm['mievformer_raw_e']`.
+- `batch_correct` now defaults to `auto`: it is enabled when `batch_key`
+  identifies multiple samples.
+
+### Added
+
+- Single-slice reference-probability CA with deterministic reference sampling,
+  automatic dimension selection, and reusable AnnData artifacts.
+- Sample-conditional CA for multiple spatial slices, including balanced
+  reference blocks, equal per-sample probability mass, and strict validation
+  of the persisted one-hot mapping.
+- Self-contained single-slice and multi-batch tutorials.
+- `representation_mode='raw'` as an explicit legacy comparison mode.
+- Direct `igraph` and `leidenalg` dependencies for the standard Leiden
+  clustering step.
+
+### Removed
+
+- The experimental `mievformer.cci.binary_cci` module and its colocated test
+  module have been removed.
+
+### Compatibility
+
+- Existing single-slice state dictionaries remain loadable.
+- Existing h5ad files are not rewritten automatically. Re-run
+  `optimize_nicheformer` to create the 0.3 standard representation contract.
+- Multi-slice CA never silently falls back to ordinary CA when its exact model
+  or conditioning metadata is missing.
+
 ## Version 0.2.0 (2026)
 
 ### Changed (Breaking — API rename for semantic clarity)

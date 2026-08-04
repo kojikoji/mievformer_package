@@ -7,6 +7,8 @@ Key Features
 ------------
 
 - **Microenvironmental Embedding**: Learn representations that parameterize the conditional distribution of cellular states at a masked central position.
+- **Reference-Probability CA**: Use correspondence analysis as the standard representation for niche clustering and UMAP.
+- **Multi-Batch Analysis**: Jointly analyze multiple spatial slices with sample-conditioned training and balanced sample-conditional CA.
 - **Superior Accuracy**: Outperforms existing methods across diverse simulation settings and real datasets.
 - **Downstream Analyses**: Enables microenvironmental clustering, cell subpopulation identification, and colocalization analysis.
 - **Seamless Integration**: Works with AnnData objects and integrates with the scanpy ecosystem.
@@ -30,11 +32,8 @@ Basic usage example:
    # Load your spatial transcriptomics data
    adata = sc.read_h5ad("your_data.h5ad")
 
-   # Train the model and compute microenvironmental embeddings
+   # Train the model and compute CA, UMAP, and niche clusters
    adata = mf.optimize_nicheformer(adata, model_path="model.pth")
-
-   # Calculate embeddings for downstream analysis
-   adata = mf.calculate_wb_ez(adata, "model.pth")
 
    # Compute niche density ratio and per-cell niche-cluster membership
    adata = mf.calculate_niche_density_ratio(adata)
@@ -53,6 +52,7 @@ Contents
 
    installation
    tutorials/getting_started
+   tutorials/multi_batch
 
 .. toctree::
    :maxdepth: 2

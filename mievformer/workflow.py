@@ -1,11 +1,14 @@
 import math
+from contextlib import contextmanager
+from types import SimpleNamespace
+from typing import Mapping
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 from torch.utils.data import DataLoader
 from statsmodels.stats import multitest
-from scipy import stats
+from scipy import stats, linalg
 from scipy.special import logsumexp, log_softmax, softmax
 import torch
 import torch.nn as nn
@@ -17,7 +20,96 @@ from . import nicheformer as nf
 from . import prob_nmfae as pnf
 from . import utils
 from .utils import output_dist_params
+from . import sample_conditional_ca as scca
 from sklearn.neighbors import NearestNeighbors
+
+
+MIEVFORMER_RAW_E_KEY = 'mievformer_raw_e'
+MIEVFORMER_CA_KEY = 'reference_probability_ca'
+MIEVFORMER_DEFAULT_REPRESENTATION_KEY = 'mievformer_default_representation'
+MIEVFORMER_SINGLE_SLICE_CA = 'reference_probability_ca'
+MIEVFORMER_MULTI_SLICE_CA = 'sample_conditional_reference_probability_ca'
+
+
+def _parse_bool_or_auto(value, parameter_name):
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized == 'auto':
+        return 'auto'
+    if normalized in {'1', 'true', 'yes'}:
+        return True
+    if normalized in {'0', 'false', 'no'}:
+        return False
+    raise ValueError(
+        f"{parameter_name} must be true, false, or auto; got {value!r}"
+    )
+
+
+def resolve_mievformer_batch_correction(adata, batch_key=None, batch_correct='auto'):
+    """Resolve batch correction, enabling it for data with multiple slices."""
+    requested = _parse_bool_or_auto(batch_correct, 'batch_correct')
+    if batch_key == 'same':
+        batch_key = None
+    if batch_key is None:
+        n_samples = 1
+    else:
+        if batch_key not in adata.obs:
+            raise KeyError(f"obs[{batch_key!r}] not found")
+        values = pd.Series(adata.obs[batch_key], index=adata.obs_names)
+        if values.isna().any():
+            raise ValueError(f"obs[{batch_key!r}] contains missing sample labels")
+        n_samples = int(values.astype(str).nunique())
+        if n_samples < 1:
+            raise ValueError(f"obs[{batch_key!r}] does not contain any samples")
+    if requested == 'auto':
+        return n_samples > 1
+    if requested and n_samples == 1:
+        raise ValueError(
+            'Batch correction requires a batch_key with at least two samples'
+        )
+    return requested
+
+
+def _mievformer_raw_e_key(adata, e_key=None):
+    if e_key is not None:
+        key = str(e_key)
+    else:
+        metadata = adata.uns.get(MIEVFORMER_DEFAULT_REPRESENTATION_KEY, {})
+        if isinstance(metadata, Mapping) and metadata.get('raw_embedding_key'):
+            key = str(metadata['raw_embedding_key'])
+        elif MIEVFORMER_RAW_E_KEY in adata.obsm:
+            key = MIEVFORMER_RAW_E_KEY
+        else:
+            key = 'e'
+    if key not in adata.obsm:
+        raise ValueError(f"obsm[{key!r}] is required as the raw Mievformer embedding")
+    values = np.asarray(adata.obsm[key])
+    if values.ndim != 2 or values.shape[0] != adata.n_obs:
+        raise ValueError(f"obsm[{key!r}] must have one two-dimensional row per cell")
+    if not np.isfinite(values).all():
+        raise ValueError(f"obsm[{key!r}] contains non-finite values")
+    return key
+
+
+def _mievformer_raw_e(adata, e_key=None):
+    return adata.obsm[_mievformer_raw_e_key(adata, e_key=e_key)]
+
+
+@contextmanager
+def _module_on_device(module, device):
+    """Temporarily move a module to the CA device and restore it afterwards."""
+    parameters = list(module.parameters())
+    original_device = parameters[0].device if parameters else torch.device('cpu')
+    was_training = module.training
+    resolved_device = _reference_probability_ca_device(device)
+    module.to(resolved_device)
+    module.eval()
+    try:
+        yield resolved_device
+    finally:
+        module.to(original_device)
+        module.train(was_training)
 
 
 
@@ -42,12 +134,19 @@ def analyze_state_dependence(adata, model, batch_key=None, neighbor_num=100):
     adata.obsm['X_eumap'] = adata.obsm['X_umap']
     
 
-def add_dist_across_cells(adata, model, output_mode='original', ref_num=1000):
+def add_dist_across_cells(
+    adata,
+    model,
+    output_mode='original',
+    ref_num=1000,
+    e_key=None,
+):
+    raw_e = _mievformer_raw_e(adata, e_key=e_key)
     if 'batch_one_hot' in adata.obsm.keys():
-        eb_mat = np.concatenate([adata.obsm['e'], adata.obsm['batch_one_hot']], axis=1)
+        eb_mat = np.concatenate([raw_e, adata.obsm['batch_one_hot']], axis=1)
         eds = torch.utils.data.TensorDataset(torch.tensor(eb_mat).float())
     else:
-        eds = torch.utils.data.TensorDataset(torch.tensor(adata.obsm['e']).float())
+        eds = torch.utils.data.TensorDataset(torch.tensor(raw_e).float())
     if adata.shape[0] > ref_num:
         ref_adata = utils.subset_adata(adata, ref_num)
     else:
@@ -65,12 +164,13 @@ def add_dist_across_cells(adata, model, output_mode='original', ref_num=1000):
     else:
         raise('output_mode must be one of original or dadata')
 
-def add_wb_ez(adata, model, cell_rep_key='X_pca'):
+def add_wb_ez(adata, model, cell_rep_key='X_pca', e_key=None):
+    raw_e = _mievformer_raw_e(adata, e_key=e_key)
     if 'batch_one_hot' in adata.obsm.keys():
-        eb_mat = np.concatenate([adata.obsm['e'], adata.obsm['batch_one_hot']], axis=1)
+        eb_mat = np.concatenate([raw_e, adata.obsm['batch_one_hot']], axis=1)
         ezds = torch.utils.data.TensorDataset(torch.tensor(eb_mat).float(), torch.tensor(adata.obsm[cell_rep_key]).float())
     else:
-        ezds = torch.utils.data.TensorDataset(torch.tensor(adata.obsm['e']).float(), torch.tensor(adata.obsm[cell_rep_key]).float())
+        ezds = torch.utils.data.TensorDataset(torch.tensor(raw_e).float(), torch.tensor(adata.obsm[cell_rep_key]).float())
     w_e, w_z, b_z = utils.output_wbs(ezds, model)
     adata.obsm['w_e'] = w_e.numpy()
     adata.obsm['w_z'] = w_z.numpy()
@@ -578,13 +678,32 @@ def train_nicheformer(
 
 
 
-def loading_pre_trained_model(model_path, adata, model_id_dict={}):
+def loading_pre_trained_model(model_path, adata, model_id_dict=None):
+    model_id_dict = dict(model_id_dict or {})
     latent_dim = int(model_id_dict.get('ldim', 20))
     cellrep_key = model_id_dict.get('crkey', 'X_pca')
-    batch_correct = model_id_dict.get('bcorr', 'false') =='true'
+    batch_key = model_id_dict.get('bkey')
+    batch_correct = resolve_mievformer_batch_correction(
+        adata,
+        batch_key=batch_key,
+        batch_correct=model_id_dict.get('bcorr', 'auto'),
+    )
     nlayers = int(model_id_dict.get('nlayers', 3))
     nheads = int(model_id_dict.get('nheads', 1))
-    model = nf.NicheFormer(input_dim=adata.obsm[cellrep_key].shape[1], latent_dim=latent_dim, train_ds=None, val_ds=None, batch_correct=batch_correct, num_layers=nlayers, head_num=nheads)
+    model_dataset = None
+    if batch_correct:
+        model_dataset = SimpleNamespace(
+            batch_uniq=np.arange(adata.obs[batch_key].astype(str).nunique())
+        )
+    model = nf.NicheFormer(
+        input_dim=adata.obsm[cellrep_key].shape[1],
+        latent_dim=latent_dim,
+        train_ds=model_dataset,
+        val_ds=None,
+        batch_correct=batch_correct,
+        num_layers=nlayers,
+        head_num=nheads,
+    )
     model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
     return model
 
@@ -609,7 +728,7 @@ def gpu_prod(large_mat, small_mat):
     large_mat = torch.tensor(large_mat).float()
     small_mat = torch.tensor(small_mat).float().to(device)
     dataset = torch.utils.data.TensorDataset(large_mat)
-    data_loader = DataLoader(dataset, batch_size=1024, num_workers=12, pin_memory=True)
+    data_loader = DataLoader(dataset, batch_size=1024, num_workers=0, pin_memory=True)
     res_list = []
     for batch in data_loader:
         batch = batch[0].to(device)
@@ -1054,3 +1173,1345 @@ def plot_niche_membership_clustermap(adata, cluster_key='niche_composition_clust
         plt.close()
     return g
 
+def _require_reference_probability_ca_inputs(
+    adata,
+    w_e_key='w_e',
+    w_z_key='w_z',
+    b_z_key='b_z',
+):
+    """Validate the model-derived arrays required by reference-probability CA."""
+    missing = [key for key in [w_e_key, w_z_key, b_z_key] if key not in adata.obsm]
+    if missing:
+        raise ValueError(
+            f"Missing Mievformer weight arrays in adata.obsm: {missing}. "
+            "Run add_wb_ez first; no non-Mievformer fallback is used."
+        )
+
+    w_e_shape = tuple(adata.obsm[w_e_key].shape)
+    w_z_shape = tuple(adata.obsm[w_z_key].shape)
+    b_z_shape = tuple(adata.obsm[b_z_key].shape)
+    if len(w_e_shape) != 2 or len(w_z_shape) != 2:
+        raise ValueError('w_e and w_z must be two-dimensional')
+    if w_e_shape[0] != adata.n_obs or w_z_shape[0] != adata.n_obs:
+        raise ValueError('w_e and w_z must contain one row per observation')
+    if w_e_shape[1] != w_z_shape[1]:
+        raise ValueError('w_e and w_z must have the same latent dimension')
+    if int(np.prod(b_z_shape)) != adata.n_obs:
+        raise ValueError('b_z must contain one value per observation')
+
+
+def _reference_probability_ca_device(device):
+    if device is None:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    resolved = torch.device(device)
+    if resolved.type == 'cuda' and not torch.cuda.is_available():
+        raise RuntimeError('CUDA was requested for reference-probability CA, but it is unavailable')
+    return resolved
+
+
+def _reference_probability_batches(
+    query_w_e,
+    reference_w_z,
+    reference_b_z,
+    batch_size,
+    device,
+):
+    """Yield stable common-reference softmax probabilities in query batches."""
+    if int(batch_size) < 1:
+        raise ValueError('batch_size must be at least 1')
+    reference_w_z = np.asarray(reference_w_z, dtype=np.float32)
+    reference_b_z = np.asarray(reference_b_z, dtype=np.float32).reshape(-1)
+    if reference_w_z.ndim != 2:
+        raise ValueError('reference_w_z must be two-dimensional')
+    if reference_w_z.shape[0] != reference_b_z.shape[0]:
+        raise ValueError('reference_w_z and reference_b_z have incompatible shapes')
+    if len(query_w_e.shape) != 2 or query_w_e.shape[1] != reference_w_z.shape[1]:
+        raise ValueError('query_w_e and reference_w_z have incompatible shapes')
+    if not np.isfinite(reference_w_z).all():
+        raise ValueError('reference_w_z must contain only finite values')
+    if not np.isfinite(reference_b_z).all():
+        raise ValueError('reference_b_z must contain only finite values')
+
+    if device.type == 'cuda':
+        reference_w_z_device = torch.as_tensor(
+            reference_w_z,
+            dtype=torch.float32,
+            device=device,
+        )
+        reference_b_z_device = torch.as_tensor(
+            reference_b_z,
+            dtype=torch.float32,
+            device=device,
+        )
+    else:
+        reference_w_z_t = np.ascontiguousarray(reference_w_z.T)
+
+    with torch.no_grad():
+        for start in range(0, int(query_w_e.shape[0]), int(batch_size)):
+            stop = min(start + int(batch_size), int(query_w_e.shape[0]))
+            query_batch = np.asarray(query_w_e[start:stop], dtype=np.float32)
+            if not np.isfinite(query_batch).all():
+                raise ValueError(f'query_w_e contains non-finite values in rows {start}:{stop}')
+            if device.type == 'cuda':
+                query_device = torch.as_tensor(
+                    query_batch,
+                    dtype=torch.float32,
+                    device=device,
+                )
+                logits = query_device @ reference_w_z_device.T
+                logits = logits + reference_b_z_device
+                probabilities = torch.softmax(logits, dim=1).cpu().numpy()
+                del query_device, logits
+            else:
+                logits = query_batch @ reference_w_z_t
+                logits += reference_b_z[None, :]
+                logits -= logits.max(axis=1, keepdims=True)
+                np.exp(logits, out=logits)
+                logits /= logits.sum(axis=1, keepdims=True)
+                probabilities = logits
+            probabilities = np.asarray(probabilities, dtype=np.float32)
+            if not np.isfinite(probabilities).all():
+                raise ValueError('Reference probabilities contain non-finite values')
+            row_sum_error = float(
+                np.max(np.abs(probabilities.sum(axis=1, dtype=np.float64) - 1.0))
+            )
+            if row_sum_error > 1.0e-4:
+                raise RuntimeError(
+                    f'Reference probability row sums are invalid: max error={row_sum_error}'
+                )
+            yield start, stop, probabilities
+
+
+def calculate_reference_probabilities(
+    query_w_e,
+    reference_w_z,
+    reference_b_z,
+    batch_size=2048,
+    device=None,
+):
+    """Calculate ``p(reference | query)`` under one common reference set.
+
+    This low-level helper materializes the complete probability matrix and is
+    therefore intended for fitting subsets or small datasets. Use
+    :func:`transform_reference_probability_ca` for full-dataset projection,
+    which never materializes the full ``n_cells x n_references`` matrix.
+    """
+    resolved_device = _reference_probability_ca_device(device)
+    probabilities = np.empty(
+        (int(query_w_e.shape[0]), int(np.asarray(reference_b_z).size)),
+        dtype=np.float32,
+    )
+    for start, stop, batch in _reference_probability_batches(
+        query_w_e,
+        reference_w_z,
+        reference_b_z,
+        batch_size,
+        resolved_device,
+    ):
+        probabilities[start:stop] = batch
+    return probabilities
+
+
+def _fit_reference_probability_ca_basis(probabilities, max_components, device=None):
+    """Fit an exact covariance CA basis to a common-reference probability table."""
+    probabilities = np.asarray(probabilities, dtype=np.float32)
+    if probabilities.ndim != 2:
+        raise ValueError('probabilities must be two-dimensional')
+    if not np.isfinite(probabilities).all():
+        raise ValueError('probabilities must contain only finite values')
+    n_fit, n_references = probabilities.shape
+    if n_fit < 2:
+        raise ValueError('Reference-probability CA requires at least two fitting cells')
+    max_rank = min(n_fit - 1, n_references - 1)
+    if not 1 <= int(max_components) <= max_rank:
+        raise ValueError(
+            f'max_components must be between 1 and {max_rank}; got {max_components}'
+        )
+
+    column_mass = probabilities.mean(axis=0, dtype=np.float64)
+    if not np.isfinite(column_mass).all() or np.any(column_mass <= 0):
+        invalid = int(np.sum(~np.isfinite(column_mass) | (column_mass <= 0)))
+        raise ValueError(
+            f'CA requires finite positive reference column masses; found {invalid} invalid'
+        )
+    column_mass = column_mass.astype(np.float32)
+    if not np.isfinite(column_mass).all() or np.any(column_mass <= 0):
+        invalid = int(np.sum(~np.isfinite(column_mass) | (column_mass <= 0)))
+        raise ValueError(
+            'CA requires finite positive float32 reference column masses; '
+            f'found {invalid} invalid'
+        )
+    inverse_sqrt_mass = np.reciprocal(np.sqrt(column_mass)).astype(np.float32)
+    if not np.isfinite(inverse_sqrt_mass).all():
+        raise ValueError('CA inverse square-root column masses must be finite')
+    resolved_device = _reference_probability_ca_device(device)
+    if resolved_device.type == 'cuda':
+        standardized = torch.as_tensor(
+            probabilities,
+            dtype=torch.float32,
+            device=resolved_device,
+        )
+        column_mass_device = torch.as_tensor(
+            column_mass,
+            dtype=torch.float32,
+            device=resolved_device,
+        )
+        standardized = standardized - column_mass_device[None, :]
+        standardized = standardized * torch.rsqrt(column_mass_device)[None, :]
+        covariance = standardized.T @ standardized
+        covariance /= float(n_fit - 1)
+        covariance = (covariance + covariance.T) * 0.5
+        if not bool(torch.isfinite(covariance).all().item()):
+            raise ValueError('CA covariance contains non-finite values')
+        total_variance = float(torch.trace(covariance).item())
+        if not np.isfinite(total_variance) or total_variance <= 0:
+            raise ValueError(f'CA covariance has invalid total variance: {total_variance}')
+        all_eigenvalues, all_components = torch.linalg.eigh(covariance)
+        if not bool(torch.isfinite(all_eigenvalues).all().item()):
+            raise ValueError('CA eigensolver returned non-finite eigenvalues')
+        if not bool(torch.isfinite(all_components).all().item()):
+            raise ValueError('CA eigensolver returned non-finite components')
+        eigenvalues = (
+            all_eigenvalues[-int(max_components):]
+            .flip(0)
+            .cpu()
+            .numpy()
+            .astype(np.float64, copy=False)
+        )
+        components = (
+            all_components[:, -int(max_components):]
+            .flip(1)
+            .cpu()
+            .numpy()
+            .astype(np.float32, copy=False)
+        )
+        del standardized, column_mass_device, covariance
+        del all_eigenvalues, all_components
+        torch.cuda.empty_cache()
+    else:
+        standardized = probabilities - column_mass[None, :]
+        standardized *= inverse_sqrt_mass[None, :]
+        covariance = standardized.T @ standardized
+        covariance /= float(n_fit - 1)
+        covariance = (covariance + covariance.T) * np.float32(0.5)
+        if not np.isfinite(covariance).all():
+            raise ValueError('CA covariance contains non-finite values')
+        total_variance = float(np.trace(covariance, dtype=np.float64))
+        if not np.isfinite(total_variance) or total_variance <= 0:
+            raise ValueError(f'CA covariance has invalid total variance: {total_variance}')
+        first_index = n_references - int(max_components)
+        eigenvalues, components = linalg.eigh(
+            covariance,
+            subset_by_index=[first_index, n_references - 1],
+            check_finite=False,
+            driver='evr',
+        )
+        eigenvalues = np.asarray(eigenvalues[::-1], dtype=np.float64)
+        components = np.asarray(components[:, ::-1], dtype=np.float32)
+    if not np.isfinite(eigenvalues).all():
+        raise ValueError('The requested CA spectrum contains non-finite eigenvalues')
+    if not np.isfinite(components).all():
+        raise ValueError('The requested CA components contain non-finite values')
+    # CPU and GPU metadata both refer only to the selected requested spectrum.
+    negative_count = int(np.sum(eigenvalues < 0))
+    eigenvalues = np.maximum(eigenvalues, 0.0)
+    if np.any(eigenvalues <= 0):
+        raise ValueError('The requested CA spectrum contains non-positive eigenvalues')
+
+    # Fix the otherwise arbitrary eigenvector signs for reproducible artifacts.
+    pivot_rows = np.argmax(np.abs(components), axis=0)
+    signs = np.sign(components[pivot_rows, np.arange(components.shape[1])])
+    signs[signs == 0] = 1
+    components *= signs[None, :]
+    if not np.isfinite(components).all():
+        raise ValueError('Canonicalized CA components contain non-finite values')
+    explained_variance_ratio = eigenvalues / total_variance
+    if not np.isfinite(explained_variance_ratio).all():
+        raise ValueError('CA explained-variance ratios contain non-finite values')
+    return {
+        'column_mass': column_mass,
+        'components': components,
+        'explained_variance': eigenvalues,
+        'explained_variance_ratio': explained_variance_ratio,
+        'total_variance': total_variance,
+        'negative_eigenvalue_count': negative_count,
+    }
+
+
+def _reference_probability_ca_log_chord(values, candidate_dimensions):
+    values = np.asarray(values, dtype=np.float64)
+    x = np.arange(1, values.size + 1, dtype=np.float64)
+    log_values = np.log(values)
+    denominator = float(log_values[0] - log_values[-1])
+    if not np.isfinite(denominator) or denominator <= 0:
+        raise ValueError('CA spectrum must decrease for log-chord selection')
+    x_norm = (x - x[0]) / (x[-1] - x[0])
+    y_norm = (log_values - log_values[-1]) / denominator
+    distance = np.abs(y_norm - (1.0 - x_norm))
+    candidates = np.asarray(candidate_dimensions, dtype=int)
+    return int(candidates[np.argmax(distance[candidates - 1])])
+
+
+def _reference_probability_ca_l_method(values, candidate_dimensions):
+    values = np.asarray(values, dtype=np.float64)
+    x = np.arange(1, values.size + 1, dtype=np.float64)
+    y = np.log(values)
+    rows = []
+    for dimension in np.asarray(candidate_dimensions, dtype=int):
+        error = 0.0
+        for xx, yy in [
+            (x[:dimension], y[:dimension]),
+            (x[dimension - 1:], y[dimension - 1:]),
+        ]:
+            coefficients = np.polyfit(xx, yy, 1)
+            error += float(np.sum(np.square(yy - np.polyval(coefficients, xx))))
+        rows.append((error, int(dimension)))
+    if not rows:
+        raise ValueError('No valid CA L-method breakpoint candidates')
+    return min(rows)[1]
+
+
+_REFERENCE_PROBABILITY_CA_SNAP_TIE_ATOL = 1.0e-12
+
+
+def _snap_reference_probability_ca_dimension(
+    value,
+    standard_dimensions,
+    tie_atol=_REFERENCE_PROBABILITY_CA_SNAP_TIE_ATOL,
+):
+    """Snap to the standard grid, resolving exact numerical ties downward."""
+    value = float(value)
+    standard_dimensions = np.asarray(standard_dimensions, dtype=int)
+    if not np.isfinite(value):
+        raise ValueError('CA selector dimension must be finite before grid snapping')
+    if standard_dimensions.ndim != 1 or standard_dimensions.size == 0:
+        raise ValueError('At least one standard CA dimension is required for grid snapping')
+    if not np.isfinite(tie_atol) or float(tie_atol) < 0:
+        raise ValueError('CA grid-snap tie tolerance must be finite and non-negative')
+    distances = np.abs(standard_dimensions.astype(np.float64) - value)
+    minimum_distance = float(np.min(distances))
+    tied_dimensions = standard_dimensions[
+        np.abs(distances - minimum_distance) <= float(tie_atol)
+    ]
+    return int(np.min(tied_dimensions))
+
+
+def select_reference_probability_ca_dimension(
+    reference_spectra,
+    candidate_dimensions=(5, 10, 20, 40),
+    expected_n_reference_spectra=None,
+):
+    """Select CA dimensionality from the mean relative eigengap without GT.
+
+    Spectra from every planned reference-cell sample are averaged. The largest
+    relative eigengap after components 2 through rank - 1 is snapped to the
+    nearest predeclared standard dimension, with exact grid ties resolved to
+    the smaller dimension.
+    """
+    spectra = np.asarray(reference_spectra, dtype=np.float64)
+    if spectra.ndim == 1:
+        spectra = spectra[None, :]
+    if spectra.ndim != 2 or spectra.shape[0] < 1 or spectra.shape[1] < 3:
+        raise ValueError('reference_spectra must have shape (n_repeats, >=3)')
+    if expected_n_reference_spectra is None:
+        expected_n_reference_spectra = int(spectra.shape[0])
+    expected_n_reference_spectra = int(expected_n_reference_spectra)
+    if expected_n_reference_spectra < 1:
+        raise ValueError('expected_n_reference_spectra must be at least 1')
+    if spectra.shape[0] != expected_n_reference_spectra:
+        raise ValueError(
+            'All planned reference spectra are required: '
+            f'expected {expected_n_reference_spectra}, observed {spectra.shape[0]}'
+        )
+    if not np.isfinite(spectra).all() or np.any(spectra <= 0):
+        raise ValueError('reference_spectra must contain finite positive eigenvalues')
+
+    mean_spectrum = spectra.mean(axis=0)
+    if not np.isfinite(mean_spectrum).all() or np.any(mean_spectrum <= 0):
+        raise ValueError('mean reference spectrum must contain finite positive eigenvalues')
+    standard_dimensions = np.asarray(
+        sorted(set(int(value) for value in candidate_dimensions)),
+        dtype=int,
+    )
+    standard_dimensions = standard_dimensions[
+        (standard_dimensions >= 1) & (standard_dimensions <= mean_spectrum.size)
+    ]
+    if standard_dimensions.size == 0:
+        raise ValueError('No candidate_dimensions are available in the fitted spectrum')
+    breakpoint_candidates = np.arange(2, mean_spectrum.size, dtype=int)
+    relative_gaps = mean_spectrum[:-1] / mean_spectrum[1:] - 1.0
+    if not np.isfinite(relative_gaps).all():
+        raise ValueError('Mean reference spectrum produced non-finite relative eigengaps')
+    eigengap_dimension = int(
+        breakpoint_candidates[
+            np.argmax(relative_gaps[breakpoint_candidates - 1])
+        ]
+    )
+    selector_dimensions = {'mean_relative_eigengap': eigengap_dimension}
+    selected = _snap_reference_probability_ca_dimension(
+        eigengap_dimension,
+        standard_dimensions,
+    )
+    selector_grid_dimensions = {
+        name: _snap_reference_probability_ca_dimension(
+            dimension,
+            standard_dimensions,
+        )
+        for name, dimension in selector_dimensions.items()
+    }
+    agreeing_selectors = [
+        name
+        for name, dimension in selector_grid_dimensions.items()
+        if dimension == selected
+    ]
+    minimum_selector_grid_agreement = 1
+    selector_grid_agreement_count = len(agreeing_selectors)
+    selection_accepted = True
+    diagnostics = {
+        'selection_rule': 'mean_relative_eigengap_snapped_to_standard_grid',
+        'selection_formula': (
+            'selected_grid_dimension = snap_to_standard_grid('
+            'argmax_d(mean_lambda_d / mean_lambda_(d+1) - 1), '
+            'd in 2..rank-1)'
+        ),
+        'acceptance_formula': (
+            'accept = all_planned_reference_spectra_present_finite_positive'
+        ),
+        'selected_n_components': selected,
+        'candidate_dimensions': standard_dimensions.tolist(),
+        'selector_dimensions': selector_dimensions,
+        'selector_grid_dimensions': selector_grid_dimensions,
+        'raw_selected_n_components': eigengap_dimension,
+        'minimum_selector_grid_agreement': minimum_selector_grid_agreement,
+        'selector_grid_agreement_count': selector_grid_agreement_count,
+        'selector_grid_agreement_fraction': (
+            selector_grid_agreement_count / float(len(selector_dimensions))
+        ),
+        'agreeing_selectors': agreeing_selectors,
+        'selection_accepted': selection_accepted,
+        'reference_spectrum_positive_threshold_exclusive': 0.0,
+        'expected_n_reference_spectra': expected_n_reference_spectra,
+        'n_reference_spectra': int(spectra.shape[0]),
+        'all_planned_reference_spectra_present': True,
+        'all_reference_spectra_finite': True,
+        'all_reference_spectra_positive': True,
+        'snap_tie_absolute_tolerance': (
+            _REFERENCE_PROBABILITY_CA_SNAP_TIE_ATOL
+        ),
+        'snap_tie_rule': (
+            'choose_smaller_dimension_when_grid_distances_tie_within_absolute_tolerance'
+        ),
+        'mean_explained_variance': mean_spectrum.tolist(),
+        # There is no eigengap after the final component.  Store only the
+        # mathematically defined finite values so serialized diagnostics never
+        # require a NaN sentinel.
+        'mean_relative_eigengap_after_component': relative_gaps.tolist(),
+        'ground_truth_used': False,
+        'cluster_count_used': False,
+    }
+    return selected, diagnostics
+
+
+def fit_reference_probability_ca(
+    adata,
+    reference_num=1000,
+    reference_seed=0,
+    n_components='auto',
+    dimension_reference_seeds=(0, 1, 2, 3, 4, 5, 6, 7, 8, 9),
+    candidate_dimensions=(5, 10, 20, 40),
+    max_spectrum_components=40,
+    max_fit_cells=50000,
+    fit_seed=0,
+    w_e_key='w_e',
+    w_z_key='w_z',
+    b_z_key='b_z',
+    query_batch_size=2048,
+    device=None,
+):
+    """Fit a reusable correspondence-analysis model to reference probabilities.
+
+    Reference cells are sampled from ``adata`` and define one shared softmax
+    denominator for every query cell. CA is fitted on a deterministic query
+    subset when ``n_obs > max_fit_cells``. The returned model freezes the
+    reference weights, column masses, and CA loadings needed to project new
+    cells into exactly the same feature space.
+    """
+    _require_reference_probability_ca_inputs(
+        adata,
+        w_e_key=w_e_key,
+        w_z_key=w_z_key,
+        b_z_key=b_z_key,
+    )
+    reference_num = int(reference_num)
+    reference_seed = int(reference_seed)
+    if reference_num < 2 or reference_num > adata.n_obs:
+        raise ValueError(
+            f'reference_num must be between 2 and n_obs={adata.n_obs}; got {reference_num}'
+        )
+    if max_fit_cells is None:
+        n_fit = int(adata.n_obs)
+    else:
+        n_fit = min(int(max_fit_cells), int(adata.n_obs))
+    if n_fit < 3:
+        raise ValueError('At least three fitting cells are required')
+    if n_fit == adata.n_obs:
+        fit_indices = np.arange(adata.n_obs, dtype=np.int64)
+    else:
+        fit_rng = np.random.default_rng(int(fit_seed))
+        fit_indices = np.sort(
+            fit_rng.choice(adata.n_obs, size=n_fit, replace=False)
+        ).astype(np.int64)
+
+    w_e = adata.obsm[w_e_key]
+    w_z = adata.obsm[w_z_key]
+    b_z = adata.obsm[b_z_key]
+    fit_w_e = np.asarray(w_e[fit_indices], dtype=np.float32)
+    resolved_device = _reference_probability_ca_device(device)
+    max_rank = min(n_fit - 1, reference_num - 1)
+
+    auto_dimension = isinstance(n_components, str)
+    if auto_dimension and str(n_components).lower() != 'auto':
+        raise ValueError("n_components must be an integer or 'auto'")
+    if auto_dimension:
+        max_components = min(int(max_spectrum_components), max_rank)
+        if max_components < 3:
+            raise ValueError('Automatic CA dimension selection requires at least 3 components')
+        reference_seeds = []
+        for seed in dimension_reference_seeds:
+            seed = int(seed)
+            if seed not in reference_seeds:
+                reference_seeds.append(seed)
+        if not reference_seeds:
+            raise ValueError('dimension_reference_seeds must not be empty')
+    else:
+        selected_components = int(n_components)
+        if not 1 <= selected_components <= max_rank:
+            raise ValueError(
+                f'n_components must be between 1 and {max_rank}; got {selected_components}'
+            )
+        max_components = selected_components
+        reference_seeds = [reference_seed]
+
+    spectra = []
+    final_basis = None
+    final_reference_indices = None
+    final_reference_w_z = None
+    final_reference_b_z = None
+    for seed in reference_seeds:
+        reference_rng = np.random.default_rng(seed)
+        reference_indices = np.sort(
+            reference_rng.choice(adata.n_obs, size=reference_num, replace=False)
+        ).astype(np.int64)
+        reference_w_z = np.asarray(w_z[reference_indices], dtype=np.float32)
+        reference_b_z = np.asarray(b_z[reference_indices], dtype=np.float32).reshape(-1)
+        probabilities = calculate_reference_probabilities(
+            fit_w_e,
+            reference_w_z,
+            reference_b_z,
+            batch_size=query_batch_size,
+            device=resolved_device,
+        )
+        basis = _fit_reference_probability_ca_basis(
+            probabilities,
+            max_components=max_components,
+            device=resolved_device,
+        )
+        spectra.append(basis['explained_variance'])
+        if seed == reference_seed:
+            final_basis = basis
+            final_reference_indices = reference_indices
+            final_reference_w_z = reference_w_z
+            final_reference_b_z = reference_b_z
+
+    if auto_dimension:
+        if len(spectra) != len(reference_seeds):
+            raise RuntimeError(
+                'Every unique planned dimension-reference seed must produce a spectrum: '
+                f'expected {len(reference_seeds)}, observed {len(spectra)}'
+            )
+        selected_components, selection = select_reference_probability_ca_dimension(
+            np.vstack(spectra),
+            candidate_dimensions=candidate_dimensions,
+            expected_n_reference_spectra=len(reference_seeds),
+        )
+        selection['planned_reference_seeds'] = list(reference_seeds)
+    else:
+        selection = {
+            'selection_rule': 'fixed_n_components',
+            'selected_n_components': selected_components,
+            'candidate_dimensions': [selected_components],
+            'selector_dimensions': {},
+            'selector_consensus': float(selected_components),
+            'n_reference_spectra': 1,
+            'mean_explained_variance': spectra[0].tolist(),
+            'mean_relative_eigengap_after_component': [],
+            'ground_truth_used': False,
+            'cluster_count_used': False,
+        }
+
+    if final_basis is None:
+        reference_rng = np.random.default_rng(reference_seed)
+        final_reference_indices = np.sort(
+            reference_rng.choice(adata.n_obs, size=reference_num, replace=False)
+        ).astype(np.int64)
+        final_reference_w_z = np.asarray(
+            w_z[final_reference_indices],
+            dtype=np.float32,
+        )
+        final_reference_b_z = np.asarray(
+            b_z[final_reference_indices],
+            dtype=np.float32,
+        ).reshape(-1)
+        probabilities = calculate_reference_probabilities(
+            fit_w_e,
+            final_reference_w_z,
+            final_reference_b_z,
+            batch_size=query_batch_size,
+            device=resolved_device,
+        )
+        final_basis = _fit_reference_probability_ca_basis(
+            probabilities,
+            max_components=max(max_components, selected_components),
+            device=resolved_device,
+        )
+
+    reference_obs_names = np.asarray(
+        adata.obs_names.astype(str)[final_reference_indices],
+        dtype=str,
+    )
+    return {
+        'method': 'mievformer_reference_probability_correspondence_analysis',
+        'version': 2,
+        'w_e_key': str(w_e_key),
+        'w_z_key': str(w_z_key),
+        'b_z_key': str(b_z_key),
+        'reference_num': reference_num,
+        'reference_seed': reference_seed,
+        'reference_indices': final_reference_indices,
+        'reference_obs_names': reference_obs_names,
+        'reference_w_z': final_reference_w_z,
+        'reference_b_z': final_reference_b_z,
+        'column_mass': final_basis['column_mass'],
+        'components': final_basis['components'][:, :selected_components],
+        'selected_n_components': int(selected_components),
+        'explained_variance': final_basis['explained_variance'],
+        'explained_variance_ratio': final_basis['explained_variance_ratio'],
+        'total_variance': float(final_basis['total_variance']),
+        'negative_eigenvalue_count': int(final_basis['negative_eigenvalue_count']),
+        'fit_indices': fit_indices,
+        'n_fit_cells': int(n_fit),
+        'fit_seed': int(fit_seed),
+        'dimension_reference_seeds': np.asarray(reference_seeds, dtype=np.int64),
+        'reference_spectra': np.vstack(spectra),
+        'dimension_selection': selection,
+        'query_batch_size': int(query_batch_size),
+        'fit_device': str(resolved_device),
+    }
+
+
+def validate_reference_probability_ca_dimension_artifact(
+    scores,
+    ca_model,
+    expected_n_components,
+):
+    """Validate that saved scores and a CA model implement the expected d."""
+    expected = int(expected_n_components)
+    score_array = np.asarray(scores)
+    components = np.asarray(ca_model.get('components'))
+    selected = int(ca_model.get('selected_n_components', -1))
+    if expected < 1:
+        raise ValueError('expected_n_components must be positive')
+    if score_array.ndim != 2 or score_array.shape[1] != expected:
+        raise ValueError(
+            'CA score dimension mismatch: '
+            f'expected {expected}, observed {score_array.shape}'
+        )
+    if components.ndim != 2 or components.shape[1] != expected:
+        raise ValueError(
+            'CA basis dimension mismatch: '
+            f'expected {expected}, observed {components.shape}'
+        )
+    if selected != expected:
+        raise ValueError(
+            'CA model selected_n_components mismatch: '
+            f'expected {expected}, observed {selected}'
+        )
+    if not np.isfinite(score_array).all() or not np.isfinite(components).all():
+        raise ValueError('CA dimension artifact contains non-finite values')
+    return True
+
+
+def derive_reference_probability_ca_dimension(
+    scores,
+    ca_model,
+    n_components,
+    dimension_selection=None,
+):
+    """Derive a smaller nested CA representation without refitting or transforming."""
+    selected = int(n_components)
+    source_scores = np.asarray(scores)
+    source_components = np.asarray(ca_model.get('components'))
+    source_dimension = int(ca_model.get('selected_n_components', -1))
+    if source_dimension < 1 or selected < 1 or selected > source_dimension:
+        raise ValueError(
+            'Derived CA dimension must be in [1, source selected dimension]: '
+            f'requested {selected}, source {source_dimension}'
+        )
+    if source_scores.ndim != 2 or source_scores.shape[1] != source_dimension:
+        raise ValueError('Saved CA scores do not match the source selected dimension')
+    if source_components.ndim != 2 or source_components.shape[1] != source_dimension:
+        raise ValueError('Saved CA basis does not match the source selected dimension')
+    derived_scores = np.asarray(source_scores[:, :selected], dtype=source_scores.dtype)
+    derived_model = dict(ca_model)
+    derived_model['components'] = np.asarray(
+        source_components[:, :selected], dtype=source_components.dtype
+    )
+    derived_model['selected_n_components'] = selected
+    if dimension_selection is not None:
+        selection = dict(dimension_selection)
+        if int(selection.get('selected_n_components', selected)) != selected:
+            raise ValueError('dimension_selection does not match derived dimension')
+        derived_model['dimension_selection'] = selection
+    elif isinstance(derived_model.get('dimension_selection'), dict):
+        selection = dict(derived_model['dimension_selection'])
+        selection['selected_n_components'] = selected
+        selection['derived_from_selected_n_components'] = source_dimension
+        derived_model['dimension_selection'] = selection
+    validate_reference_probability_ca_dimension_artifact(
+        derived_scores,
+        derived_model,
+        selected,
+    )
+    return derived_scores, derived_model
+
+
+def transform_reference_probability_ca(
+    adata,
+    ca_model,
+    w_e_key=None,
+    query_batch_size=None,
+    device=None,
+):
+    """Project cells with a fitted reference-probability CA model."""
+    if w_e_key is None:
+        w_e_key = str(ca_model.get('w_e_key', 'w_e'))
+    if w_e_key not in adata.obsm:
+        raise ValueError(
+            f"obsm['{w_e_key}'] is required for CA projection. "
+            "Run add_wb_ez first; no fallback is used."
+        )
+    required = ['reference_w_z', 'reference_b_z', 'column_mass', 'components']
+    missing = [key for key in required if key not in ca_model]
+    if missing:
+        raise ValueError(f'CA model is missing required fields: {missing}')
+
+    query_w_e = adata.obsm[w_e_key]
+    reference_w_z = np.asarray(ca_model['reference_w_z'], dtype=np.float32)
+    reference_b_z = np.asarray(ca_model['reference_b_z'], dtype=np.float32).reshape(-1)
+    column_mass = np.asarray(ca_model['column_mass'], dtype=np.float32).reshape(-1)
+    components = np.asarray(ca_model['components'], dtype=np.float32)
+    if reference_w_z.ndim != 2:
+        raise ValueError('CA model reference_w_z must be two-dimensional')
+    if components.ndim != 2 or components.shape[1] < 1:
+        raise ValueError('CA model components must be a non-empty two-dimensional array')
+    if (
+        reference_w_z.shape[0] != reference_b_z.size
+        or reference_w_z.shape[0] != column_mass.size
+        or components.shape[0] != column_mass.size
+    ):
+        raise ValueError('CA model reference arrays have incompatible shapes')
+    for name, values in [
+        ('reference_w_z', reference_w_z),
+        ('reference_b_z', reference_b_z),
+        ('column_mass', column_mass),
+        ('components', components),
+    ]:
+        if not np.isfinite(values).all():
+            raise ValueError(f'CA model {name} must contain only finite values')
+    if np.any(column_mass <= 0) or not np.isfinite(column_mass).all():
+        raise ValueError('CA model column masses must be finite and positive')
+    if query_batch_size is None:
+        query_batch_size = int(ca_model.get('query_batch_size', 2048))
+    resolved_device = _reference_probability_ca_device(device)
+    scores = np.empty((adata.n_obs, components.shape[1]), dtype=np.float32)
+    inverse_sqrt_mass = np.reciprocal(np.sqrt(column_mass)).astype(np.float32)
+    if not np.isfinite(inverse_sqrt_mass).all():
+        raise ValueError('CA model inverse square-root column masses must be finite')
+    for start, stop, probabilities in _reference_probability_batches(
+        query_w_e,
+        reference_w_z,
+        reference_b_z,
+        query_batch_size,
+        resolved_device,
+    ):
+        probabilities -= column_mass[None, :]
+        probabilities *= inverse_sqrt_mass[None, :]
+        scores[start:stop] = probabilities @ components
+    if not np.isfinite(scores).all():
+        raise ValueError('Projected CA scores contain non-finite values')
+    return scores
+
+
+def add_reference_probability_ca_features(
+    adata,
+    model=None,
+    cell_rep_key='X_pca',
+    feature_key='reference_probability_ca',
+    copy=False,
+    **fit_kwargs,
+):
+    """Fit and add scalable Mievformer reference-probability CA features.
+
+    If ``w_e``, ``w_z``, or ``b_z`` is absent, an explicit Mievformer model is
+    required and the exact weights are calculated with :func:`add_wb_ez`.
+    """
+    if copy:
+        adata = adata.copy()
+    weight_keys = [
+        fit_kwargs.get('w_e_key', 'w_e'),
+        fit_kwargs.get('w_z_key', 'w_z'),
+        fit_kwargs.get('b_z_key', 'b_z'),
+    ]
+    if not all(key in adata.obsm for key in weight_keys):
+        if model is None:
+            raise ValueError(
+                f'Missing Mievformer weight arrays {weight_keys}; provide model or run add_wb_ez'
+            )
+        if weight_keys != ['w_e', 'w_z', 'b_z']:
+            raise ValueError('Custom weight keys cannot be generated by add_wb_ez')
+        adata = add_wb_ez(adata, model, cell_rep_key=cell_rep_key)
+    ca_model = fit_reference_probability_ca(adata, **fit_kwargs)
+    adata.obsm[feature_key] = transform_reference_probability_ca(
+        adata,
+        ca_model,
+        w_e_key=fit_kwargs.get('w_e_key', 'w_e'),
+        query_batch_size=fit_kwargs.get('query_batch_size', None),
+        device=fit_kwargs.get('device', None),
+    )
+    adata.uns[feature_key] = ca_model
+    return adata, ca_model
+
+
+def project_reference_probability_ca_features(
+    adata,
+    ca_model,
+    feature_key='reference_probability_ca',
+    w_e_key=None,
+    query_batch_size=None,
+    device=None,
+    copy=False,
+):
+    """Add CA scores to new cells using a frozen fitted CA model."""
+    if copy:
+        adata = adata.copy()
+    adata.obsm[feature_key] = transform_reference_probability_ca(
+        adata,
+        ca_model,
+        w_e_key=w_e_key,
+        query_batch_size=query_batch_size,
+        device=device,
+    )
+    adata.uns[feature_key] = ca_model
+    return adata
+
+
+def _mievformer_sample_context(adata, sample_key=None):
+    """Return the effective sample key and its persisted/observed order."""
+    contract = adata.uns.get('mievformer_batch_contract', {})
+    if sample_key == 'same':
+        sample_key = None
+    if sample_key is None and isinstance(contract, Mapping):
+        contract_key = contract.get('batch_key')
+        if contract_key in adata.obs:
+            sample_key = str(contract_key)
+    if sample_key is None:
+        return None, ()
+    sample_key = str(sample_key)
+    if sample_key not in adata.obs:
+        raise KeyError(f"obs[{sample_key!r}] not found")
+    values = pd.Series(adata.obs[sample_key], index=adata.obs_names)
+    if values.isna().any():
+        raise ValueError(f"obs[{sample_key!r}] contains missing sample labels")
+    observed = values.astype(str).to_numpy()
+    observed_set = set(observed)
+    if not observed_set:
+        raise ValueError(f"obs[{sample_key!r}] does not contain any samples")
+
+    contract_order = []
+    if isinstance(contract, Mapping) and contract.get('batch_key') == sample_key:
+        contract_order = [str(value) for value in contract.get('batch_order', [])]
+    if contract_order:
+        if len(contract_order) != len(set(contract_order)):
+            raise ValueError('Persisted Mievformer batch order contains duplicates')
+        if set(contract_order) != observed_set:
+            raise ValueError(
+                'Persisted Mievformer batch order does not match observed samples'
+            )
+        order = tuple(contract_order)
+    else:
+        order = tuple(str(value) for value in pd.unique(observed))
+    return sample_key, order
+
+
+def resolve_mievformer_ca_strategy(adata, sample_key=None, strategy='auto'):
+    """Resolve the standard CA strategy from the number of observed slices.
+
+    ``auto`` selects ordinary Mievformer reference-probability CA for a single
+    slice and sample-conditional CA for two or more slices.  Explicit strategy
+    selection remains available for controlled method-comparison benchmarks.
+    """
+    effective_sample_key, sample_order = _mievformer_sample_context(
+        adata,
+        sample_key=sample_key,
+    )
+    n_samples = max(1, len(sample_order))
+    aliases = {
+        'auto': 'auto',
+        'single': MIEVFORMER_SINGLE_SLICE_CA,
+        'single_slice': MIEVFORMER_SINGLE_SLICE_CA,
+        'mievformer_ca': MIEVFORMER_SINGLE_SLICE_CA,
+        'reference_probability_ca': MIEVFORMER_SINGLE_SLICE_CA,
+        'multi': MIEVFORMER_MULTI_SLICE_CA,
+        'multi_slice': MIEVFORMER_MULTI_SLICE_CA,
+        'sample_conditional': MIEVFORMER_MULTI_SLICE_CA,
+        'sample_conditioned': MIEVFORMER_MULTI_SLICE_CA,
+        'sample_conditional_reference_probability_ca': MIEVFORMER_MULTI_SLICE_CA,
+    }
+    normalized = str(strategy).strip().lower()
+    if normalized not in aliases:
+        raise ValueError(
+            'strategy must be auto, reference_probability_ca, or '
+            'sample_conditional_reference_probability_ca'
+        )
+    resolved = aliases[normalized]
+    if resolved == 'auto':
+        resolved = (
+            MIEVFORMER_MULTI_SLICE_CA
+            if n_samples > 1
+            else MIEVFORMER_SINGLE_SLICE_CA
+        )
+    if resolved == MIEVFORMER_MULTI_SLICE_CA and n_samples < 2:
+        raise ValueError(
+            'Sample-conditional CA requires a sample_key with at least two slices'
+        )
+    return resolved
+
+
+def _default_mievformer_ca_reference_num(
+    adata,
+    strategy,
+    sample_key=None,
+    maximum=1000,
+):
+    maximum = min(int(maximum), int(adata.n_obs))
+    if strategy == MIEVFORMER_SINGLE_SLICE_CA:
+        if maximum < 2:
+            raise ValueError('Mievformer CA requires at least two cells')
+        return maximum
+    effective_sample_key, sample_order = _mievformer_sample_context(
+        adata,
+        sample_key=sample_key,
+    )
+    batches = adata.obs[effective_sample_key].astype(str).to_numpy()
+    counts = {
+        sample: int(np.count_nonzero(batches == sample))
+        for sample in sample_order
+    }
+    for reference_num in range(maximum, len(sample_order) - 1, -1):
+        quotas = scca.equal_sample_quotas(sample_order, reference_num)
+        if all(counts[sample] >= quotas[sample] for sample in sample_order):
+            if reference_num < 3:
+                break
+            return reference_num
+    raise ValueError(
+        'Sample-conditional CA needs at least three balanced references across samples'
+    )
+
+
+def _require_mievformer_e2w(model):
+    if model is None:
+        raise ValueError(
+            'A batch-corrected Mievformer model is required for multi-slice '
+            'sample-conditional CA; ordinary CA is not used as a fallback.'
+        )
+    distributor = getattr(model, 'distributor', None)
+    e2w = getattr(distributor, 'e2w', None)
+    if not isinstance(e2w, torch.nn.Module):
+        raise ValueError('The Mievformer model does not expose distributor.e2w')
+    return e2w
+
+
+def fit_sample_conditional_reference_probability_ca(
+    adata,
+    model,
+    sample_key,
+    reference_num=1000,
+    reference_seed=0,
+    n_components='auto',
+    dimension_reference_seeds=(0, 1, 2, 3, 4, 5, 6, 7, 8, 9),
+    candidate_dimensions=(5, 10, 20, 40),
+    max_spectrum_components=40,
+    max_fit_cells=50000,
+    fit_seed=0,
+    e_key=None,
+    batch_one_hot_key='batch_one_hot',
+    w_e_key='w_e',
+    w_z_key='w_z',
+    b_z_key='b_z',
+    query_batch_size=2048,
+    device=None,
+):
+    """Fit reusable multi-slice, sample-conditional Mievformer CA."""
+    _require_reference_probability_ca_inputs(
+        adata,
+        w_e_key=w_e_key,
+        w_z_key=w_z_key,
+        b_z_key=b_z_key,
+    )
+    effective_sample_key, sample_order = _mievformer_sample_context(
+        adata,
+        sample_key=sample_key,
+    )
+    if len(sample_order) < 2:
+        raise ValueError('Sample-conditional CA requires at least two slices')
+    if batch_one_hot_key not in adata.obsm:
+        raise ValueError(
+            f"obsm[{batch_one_hot_key!r}] is required for multi-slice "
+            'sample-conditional CA; ordinary CA is not used as a fallback.'
+        )
+    raw_e_key = _mievformer_raw_e_key(adata, e_key=e_key)
+    raw_e = np.asarray(adata.obsm[raw_e_key], dtype=np.float32)
+    batch_one_hot = np.asarray(adata.obsm[batch_one_hot_key], dtype=np.float32)
+    batches = adata.obs[effective_sample_key].astype(str).to_numpy()
+    one_hot_mapping = scca.derive_sample_one_hot_mapping(
+        batches,
+        batch_one_hot,
+        expected_order=sample_order,
+    )
+    e2w = _require_mievformer_e2w(model)
+    reference_num = int(reference_num)
+    if max_fit_cells is None:
+        n_fit = int(adata.n_obs)
+    else:
+        n_fit = min(int(max_fit_cells), int(adata.n_obs))
+    if n_fit < 3:
+        raise ValueError('At least three fitting cells are required')
+    if n_fit == adata.n_obs:
+        fit_indices = np.arange(adata.n_obs, dtype=np.int64)
+    else:
+        fit_indices = np.sort(
+            np.random.default_rng(int(fit_seed)).choice(
+                adata.n_obs,
+                size=n_fit,
+                replace=False,
+            )
+        ).astype(np.int64)
+
+    with _module_on_device(e2w, device) as resolved_device:
+        reproduction = scca.verify_observed_w_e(
+            raw_e,
+            batch_one_hot,
+            adata.obsm[w_e_key],
+            e2w,
+            batch_size=int(query_batch_size),
+            device=resolved_device,
+        )
+        ca_model = scca.fit_sample_conditional_ca(
+            raw_e[fit_indices],
+            adata.obsm[w_z_key],
+            adata.obsm[b_z_key],
+            batches,
+            sample_order=sample_order,
+            e2w=e2w,
+            sample_one_hot=one_hot_mapping,
+            reference_num=reference_num,
+            reference_seed=int(reference_seed),
+            n_components=n_components,
+            dimension_reference_seeds=dimension_reference_seeds,
+            candidate_dimensions=candidate_dimensions,
+            max_spectrum_components=int(max_spectrum_components),
+            query_batch_size=int(query_batch_size),
+            fit_indices=fit_indices,
+            device=resolved_device,
+        )
+    ca_model.update(
+        {
+            'strategy': MIEVFORMER_MULTI_SLICE_CA,
+            'sample_key': effective_sample_key,
+            'n_samples': len(sample_order),
+            'e_key': raw_e_key,
+            'batch_one_hot_key': str(batch_one_hot_key),
+            'w_e_key': str(w_e_key),
+            'w_z_key': str(w_z_key),
+            'b_z_key': str(b_z_key),
+            'reference_obs_names': np.asarray(
+                adata.obs_names.astype(str)[ca_model['reference_indices']],
+                dtype=str,
+            ),
+            'n_fit_cells': int(n_fit),
+            'fit_seed': int(fit_seed),
+            'distributor_reproduction': reproduction,
+        }
+    )
+    return ca_model
+
+
+def transform_sample_conditional_reference_probability_ca(
+    adata,
+    ca_model,
+    model,
+    e_key=None,
+    query_batch_size=None,
+    device=None,
+    return_audit=False,
+):
+    """Project cells using a frozen sample-conditional Mievformer CA model."""
+    if ca_model.get('method') != 'mievformer_sample_conditional_reference_probability_ca':
+        raise ValueError('The supplied CA model is not sample-conditional')
+    if e_key is None:
+        e_key = ca_model.get('e_key')
+    raw_e = _mievformer_raw_e(adata, e_key=e_key)
+    if query_batch_size is None:
+        query_batch_size = int(ca_model.get('query_batch_size', 2048))
+    e2w = _require_mievformer_e2w(model)
+    with _module_on_device(e2w, device) as resolved_device:
+        scores, audit = scca.transform_sample_conditional_ca(
+            raw_e,
+            ca_model,
+            e2w=e2w,
+            batch_size=int(query_batch_size),
+            device=resolved_device,
+        )
+    if return_audit:
+        return scores, audit
+    return scores
+
+
+def fit_mievformer_ca(
+    adata,
+    model=None,
+    sample_key=None,
+    strategy='auto',
+    reference_num=None,
+    reference_seed=0,
+    n_components='auto',
+    dimension_reference_seeds=(0, 1, 2, 3, 4, 5, 6, 7, 8, 9),
+    candidate_dimensions=(5, 10, 20, 40),
+    max_spectrum_components=40,
+    max_fit_cells=50000,
+    fit_seed=0,
+    e_key=None,
+    batch_one_hot_key='batch_one_hot',
+    w_e_key='w_e',
+    w_z_key='w_z',
+    b_z_key='b_z',
+    query_batch_size=2048,
+    device=None,
+):
+    """Fit the standard Mievformer CA selected by observed slice count."""
+    resolved_strategy = resolve_mievformer_ca_strategy(
+        adata,
+        sample_key=sample_key,
+        strategy=strategy,
+    )
+    effective_sample_key, sample_order = _mievformer_sample_context(
+        adata,
+        sample_key=sample_key,
+    )
+    if reference_num is None:
+        reference_num = _default_mievformer_ca_reference_num(
+            adata,
+            resolved_strategy,
+            sample_key=effective_sample_key,
+        )
+    common_kwargs = {
+        'reference_num': int(reference_num),
+        'reference_seed': int(reference_seed),
+        'n_components': n_components,
+        'dimension_reference_seeds': dimension_reference_seeds,
+        'candidate_dimensions': candidate_dimensions,
+        'max_spectrum_components': int(max_spectrum_components),
+        'max_fit_cells': max_fit_cells,
+        'fit_seed': int(fit_seed),
+        'w_e_key': w_e_key,
+        'w_z_key': w_z_key,
+        'b_z_key': b_z_key,
+        'query_batch_size': int(query_batch_size),
+        'device': device,
+    }
+    if resolved_strategy == MIEVFORMER_SINGLE_SLICE_CA:
+        ca_model = fit_reference_probability_ca(adata, **common_kwargs)
+        ca_model = dict(ca_model)
+        ca_model.update(
+            {
+                'strategy': MIEVFORMER_SINGLE_SLICE_CA,
+                'sample_key': '' if effective_sample_key is None else effective_sample_key,
+                'n_samples': max(1, len(sample_order)),
+                'standard_scope': 'single_slice',
+            }
+        )
+        return ca_model
+    return fit_sample_conditional_reference_probability_ca(
+        adata,
+        model,
+        effective_sample_key,
+        e_key=e_key,
+        batch_one_hot_key=batch_one_hot_key,
+        **common_kwargs,
+    )
+
+
+def transform_mievformer_ca(
+    adata,
+    ca_model,
+    model=None,
+    e_key=None,
+    query_batch_size=None,
+    device=None,
+    return_audit=False,
+):
+    """Project cells with either supported Mievformer CA artifact."""
+    strategy = ca_model.get('strategy')
+    method = ca_model.get('method')
+    if (
+        strategy == MIEVFORMER_MULTI_SLICE_CA
+        or method == 'mievformer_sample_conditional_reference_probability_ca'
+    ):
+        return transform_sample_conditional_reference_probability_ca(
+            adata,
+            ca_model,
+            model,
+            e_key=e_key,
+            query_batch_size=query_batch_size,
+            device=device,
+            return_audit=return_audit,
+        )
+    scores = transform_reference_probability_ca(
+        adata,
+        ca_model,
+        query_batch_size=query_batch_size,
+        device=device,
+    )
+    if return_audit:
+        return scores, {}
+    return scores
+
+
+def _set_mievformer_ca_as_default(adata, scores, ca_model, feature_key):
+    raw_e_key = _mievformer_raw_e_key(adata, e_key=ca_model.get('e_key'))
+    if raw_e_key == 'e':
+        adata.obsm[MIEVFORMER_RAW_E_KEY] = np.asarray(
+            adata.obsm['e'], dtype=np.float32
+        ).copy()
+        raw_e_key = MIEVFORMER_RAW_E_KEY
+        ca_model['e_key'] = raw_e_key
+    adata.obsm['e'] = np.asarray(scores, dtype=np.float32).copy()
+    adata.uns[MIEVFORMER_DEFAULT_REPRESENTATION_KEY] = {
+        'default_embedding_key': 'e',
+        'ca_feature_key': str(feature_key),
+        'raw_embedding_key': raw_e_key,
+        'strategy': str(ca_model['strategy']),
+        'sample_key': str(ca_model.get('sample_key', '')),
+        'n_samples': int(ca_model.get('n_samples', 1)),
+        'selected_n_components': int(ca_model['selected_n_components']),
+        'selection_policy': 'single_slice_ca_multi_slice_sample_conditional_ca',
+        'raw_embedding_retained': True,
+        'silent_fallback_used': False,
+    }
+
+
+def add_mievformer_ca_features(
+    adata,
+    model=None,
+    sample_key=None,
+    strategy='auto',
+    feature_key=MIEVFORMER_CA_KEY,
+    cell_rep_key='X_pca',
+    set_as_default=True,
+    copy=False,
+    **fit_kwargs,
+):
+    """Add the benchmark-supported standard Mievformer representation.
+
+    Single-slice data use ordinary reference-probability CA.  Multi-slice data
+    use sample-conditional CA and require the exact batch-corrected model and
+    persisted batch one-hot rows.  Missing multi-slice inputs raise an error;
+    there is no ordinary-CA or distance-based fallback.
+    """
+    if copy:
+        adata = adata.copy()
+    if feature_key == 'e':
+        raise ValueError("feature_key='e' is reserved for the standard-view alias")
+    weight_keys = [
+        fit_kwargs.get('w_e_key', 'w_e'),
+        fit_kwargs.get('w_z_key', 'w_z'),
+        fit_kwargs.get('b_z_key', 'b_z'),
+    ]
+    if not all(key in adata.obsm for key in weight_keys):
+        if model is None:
+            raise ValueError(
+                f'Missing Mievformer weight arrays {weight_keys}; provide the '
+                'exact model or run add_wb_ez. No fallback is used.'
+            )
+        if weight_keys != ['w_e', 'w_z', 'b_z']:
+            raise ValueError('Custom weight keys cannot be generated by add_wb_ez')
+        adata = add_wb_ez(
+            adata,
+            model,
+            cell_rep_key=cell_rep_key,
+            e_key=fit_kwargs.get('e_key'),
+        )
+    ca_model = fit_mievformer_ca(
+        adata,
+        model=model,
+        sample_key=sample_key,
+        strategy=strategy,
+        **fit_kwargs,
+    )
+    scores, transform_audit = transform_mievformer_ca(
+        adata,
+        ca_model,
+        model=model,
+        e_key=fit_kwargs.get('e_key'),
+        query_batch_size=fit_kwargs.get('query_batch_size'),
+        device=fit_kwargs.get('device'),
+        return_audit=True,
+    )
+    ca_model['transform_probability_audit'] = transform_audit
+    adata.obsm[feature_key] = np.asarray(scores, dtype=np.float32)
+    if set_as_default:
+        _set_mievformer_ca_as_default(adata, scores, ca_model, feature_key)
+    adata.uns[feature_key] = ca_model
+    return adata, ca_model
+
+
+def project_mievformer_ca_features(
+    adata,
+    ca_model,
+    model=None,
+    feature_key=MIEVFORMER_CA_KEY,
+    set_as_default=True,
+    e_key=None,
+    query_batch_size=None,
+    device=None,
+    copy=False,
+):
+    """Add a standard Mievformer CA view using a frozen fitted artifact."""
+    if copy:
+        adata = adata.copy()
+    scores, transform_audit = transform_mievformer_ca(
+        adata,
+        ca_model,
+        model=model,
+        e_key=e_key,
+        query_batch_size=query_batch_size,
+        device=device,
+        return_audit=True,
+    )
+    stored_model = dict(ca_model)
+    stored_model['transform_probability_audit'] = transform_audit
+    adata.obsm[feature_key] = np.asarray(scores, dtype=np.float32)
+    if set_as_default:
+        _set_mievformer_ca_as_default(adata, scores, stored_model, feature_key)
+    adata.uns[feature_key] = stored_model
+    return adata

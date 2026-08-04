@@ -8,6 +8,11 @@ Core Model Functions
 
 Functions for training the Mievformer model and computing embeddings.
 
+``optimize_nicheformer`` uses reference-probability CA by default. Single-slice
+data use ordinary CA; multiple values in ``batch_key`` use sample-conditional
+CA and automatically enable batch-conditioned training. The raw neural-network
+embedding remains available in ``obsm['mievformer_raw_e']``.
+
 .. autofunction:: mievformer.optimize_nicheformer
 
 .. autofunction:: mievformer.calculate_wb_ez

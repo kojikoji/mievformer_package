@@ -22,7 +22,8 @@ The core optimization process is performed by {func}`mievformer.optimize_nichefo
 *   Preprocessing of spatial coordinates.
 *   Construction of the dataset with masked central cells.
 *   Training of the Transformer-based model using masked self-supervised learning.
-*   Computation of microenvironmental embeddings $e_i$.
+*   Computation of raw microenvironmental embeddings.
+*   Reference-probability correspondence analysis (CA), niche clustering, and UMAP.
 
 For each cell $i$, the embedding $e_i$ is computed from the cell states $\{z_j \mid j \in N(i)\}$ within its spatial neighborhood $N(i)$. The neighborhood is determined using k-nearest neighbors (default 100). Spatial coordinates are encoded as relative positions and transformed into positional encodings via sinusoidal encoding.
 
@@ -35,7 +36,23 @@ Mievformer employs a masked self-supervised learning framework to compute the pr
 
 The training objective maximizes the likelihood that the observed central cell state $z_i$ is generated from its inferred microenvironment $e_i$. This formulation corresponds to the InfoNCE loss, maximizing mutual information between paired observations.
 
-After training, {func}`mievformer.calculate_wb_ez` can be used to calculate the embeddings required for the score function ($w_e$, $w_z$, $b_z$) and add them to the AnnData object.
+After training, Mievformer evaluates the score function against a shared panel
+of reference niches and performs correspondence analysis on the resulting
+reference-probability table. This CA representation is the standard input for
+the neighbor graph, UMAP, and Leiden niche clustering. The raw neural-network
+embedding is retained separately for reproducibility. The score-function terms
+($w_e$, $w_z$, $b_z$) are also added automatically; {func}`mievformer.calculate_wb_ez`
+can reload them from an existing model when needed.
+
+### Multiple Spatial Slices
+
+When ``batch_key`` identifies multiple samples, Mievformer constructs spatial
+neighbors independently within each slice and enables sample-conditioned
+training. Reference cells are balanced across samples, the distributor is
+evaluated counterfactually for each sample condition, and every sample block
+receives equal probability mass before CA. The exact sample order and one-hot
+mapping are persisted in the AnnData result. Missing conditioning inputs raise
+an error rather than triggering an ordinary-CA fallback.
 
 ### Downstream Analyses
 

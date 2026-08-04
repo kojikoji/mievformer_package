@@ -49,16 +49,16 @@ class MultiNicheDataSet(torch.utils.data.Dataset):
         store relative position of nearest neighbors in self.rel_pos
         """
         super().__init__()
-        self.batchs = batchs
-        self.batch_uniq = batchs.unique()
-        self.batch_nums = pd.Series(batchs).value_counts()[self.batch_uniq]
+        self.batchs = np.asarray(batchs).astype(str)
+        self.batch_uniq = pd.unique(self.batchs)
+        self.batch_nums = (
+            pd.Series(self.batchs).value_counts(sort=False).reindex(self.batch_uniq)
+        )
         expected_batchs = np.concatenate([np.repeat(batch, n) for batch, n in self.batch_nums.items()])
-        try:
-            assert np.all(expected_batchs == batchs)
-        except:
+        if not np.array_equal(expected_batchs, self.batchs):
             raise ValueError(f'batchs must be a continous in the order, {self.batch_uniq}.')
         self.ds_dict = {
-            batch: NicheDataSet(z[batchs == batch], pos[batchs == batch], neighbor_num) for batch in self.batch_uniq
+            batch: NicheDataSet(z[self.batchs == batch], pos[self.batchs == batch], neighbor_num) for batch in self.batch_uniq
         }
         self.batch_start = {
             batch: self.batch_nums[:i].sum() for i, batch in enumerate(self.batch_uniq)
@@ -139,7 +139,7 @@ class NicheEncoder(nn.Module):
         mu = self.h2mu(zs)
         sigma = self.h2sigma(zs)
         qe = torch.distributions.Normal(mu, sigma)
-        if self.training:
+        if self.training and self.stochastic:
             e = qe.rsample()
         else:
             e = qe.loc
@@ -213,11 +213,15 @@ class Distributor(nn.Module):
         )
         self.logsoftmax = nn.LogSoftmax(dim=-1)
 
-    def forward(self, e, z):
+    def forward(self, e, z, batch=None):
         w_e = self.e2w(e)
         wb_z = self.z2wb(z)
         w_z, b_z = wb_z[..., :-1], wb_z[..., -1]
-        lp = self.logsoftmax(w_e @ w_z.T + b_z)
+        logits = w_e @ w_z.T + b_z
+        if batch is not None:
+            same_batch = (batch.unsqueeze(0) * batch.unsqueeze(1)).sum(dim=-1)
+            logits = logits * same_batch - 1.0e6 * (1 - same_batch)
+        lp = self.logsoftmax(logits)
         return lp
         
 
@@ -292,7 +296,8 @@ class NicheFormer(PlBaseModule):
     def __init__(self, input_dim, latent_dim, train_ds, val_ds, kld_ld=0.1, pent_ld=0.05, dist_space='latent', batch_size=128, batch_correct=False, epoch_size=100000, num_layers=3, head_num=1) -> None:
         super().__init__()
         if batch_correct:
-            batch_num = len(train_ds.batch_uniq)
+            base_ds = train_ds.dataset if hasattr(train_ds, 'dataset') else train_ds
+            batch_num = len(base_ds.batch_uniq)
             self.niche_encoder = NicheEncoder(input_dim=input_dim, latent_dim=latent_dim, num_layers=num_layers, head_num=head_num)
             self.distributor = Distributor(input_dim=input_dim, latent_dim=latent_dim + batch_num)
             self.forward = self.forward_multi_batch
@@ -320,7 +325,7 @@ class NicheFormer(PlBaseModule):
         # zs = torch.cat([zs, repeat(batchs, 'b s -> b k s', k=zs.size()[1])], dim=-1)
         e, qe = self.niche_encoder(zs, rel_pos)
         eb = torch.cat([e, batchs], dim=-1)
-        lp = self.distributor(eb, z)
+        lp = self.distributor(eb, z, batch=batchs)
         return e, qe, lp
 
     def forward_one_batch(self, *batch):
@@ -352,7 +357,7 @@ class NicheFormer(PlBaseModule):
             self.train_ds,
             batch_size=self.batch_size,
             shuffle=False,
-            num_workers=1,
+            num_workers=0,
             pin_memory=True,
             drop_last=True,
             sampler=SubsetRandomSampler(
@@ -473,7 +478,7 @@ class ScDistributor(PlBaseModule):
             self.train_ds,
             batch_size=self.batch_size,
             shuffle=False,
-            num_workers=1,
+            num_workers=0,
             pin_memory=True,
             drop_last=True
         )
@@ -609,7 +614,7 @@ class scVAE(PlBaseModule):
             self.train_ds,
             batch_size=self.batch_size,
             shuffle=False,
-            num_workers=1,
+            num_workers=0,
             pin_memory=True,
             drop_last=True,
             sampler=SubsetRandomSampler(
@@ -723,5 +728,3 @@ class NicheDynamics(PlBaseModule):
         v_kinetics, l1_w_tf2tg = self.calc_v_kinetics(p, x)
         kinetics_loss = (nn.MSELoss(v_latent, v_kinetics) * p).mean()
         return dist_dyn_loss, kinetics_loss, l1_w_tf2tg
-
-

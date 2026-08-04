@@ -43,7 +43,7 @@ def output_metrics(ds, model, batch_size=128):
 
 @torch.no_grad()
 def output_niche_rep(ds, model, batch_size=128):
-    data_loader = DataLoader(ds, batch_size=batch_size, num_workers=12, pin_memory=True)
+    data_loader = DataLoader(ds, batch_size=batch_size, num_workers=0, pin_memory=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device)
     model.eval()
@@ -60,7 +60,7 @@ def output_niche_rep(ds, model, batch_size=128):
 
 @torch.no_grad()
 def output_wbs(ds, model, batch_size=128):
-    data_loader = DataLoader(ds, batch_size=batch_size, num_workers=12, pin_memory=True)
+    data_loader = DataLoader(ds, batch_size=batch_size, num_workers=0, pin_memory=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device)
     model.eval()
@@ -287,7 +287,7 @@ def get_clsuters_centroid_idxs(adata, cluster_key, rep_key='e', ref_num=1000):
 
 @torch.no_grad()
 def output_dist_params(ds, model, batch_size=128):
-    data_loader = DataLoader(ds, batch_size=batch_size, num_workers=12, pin_memory=True)
+    data_loader = DataLoader(ds, batch_size=batch_size, num_workers=0, pin_memory=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device)
     model.eval()
